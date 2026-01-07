@@ -1,4 +1,4 @@
-import express from 'express';
+import express from "express";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
@@ -10,16 +10,7 @@ const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY;
 const HUBSPOT_API_URL = "https://api.hubapi.com";
 const PORT = process.env.PORT || 3000;
 
-interface TicketData {
-  subject: string;
-  content: string;
-  priority?: "LOW" | "MEDIUM" | "HIGH";
-  category?: string;
-  contactEmail?: string;
-  contactName?: string;
-}
-
-async function createHubSpotTicket(data: TicketData) {
+async function createHubSpotTicket(data) {
   if (!HUBSPOT_API_KEY) {
     throw new Error("HUBSPOT_API_KEY environment variable is not set");
   }
@@ -29,7 +20,7 @@ async function createHubSpotTicket(data: TicketData) {
     contactId = await findOrCreateContact(data.contactEmail, data.contactName);
   }
 
-  const ticketProperties: any = {
+  const ticketProperties = {
     subject: data.subject,
     content: data.content,
     hs_pipeline: "0",
@@ -44,7 +35,7 @@ async function createHubSpotTicket(data: TicketData) {
     ticketProperties.hs_ticket_category = data.category;
   }
 
-  const ticketPayload: any = {
+  const ticketPayload = {
     properties: ticketProperties,
   };
 
@@ -79,7 +70,7 @@ async function createHubSpotTicket(data: TicketData) {
   return await response.json();
 }
 
-async function findOrCreateContact(email: string, name?: string) {
+async function findOrCreateContact(email, name) {
   const searchResponse = await fetch(
     `${HUBSPOT_API_URL}/crm/v3/objects/contacts/search`,
     {
@@ -110,8 +101,8 @@ async function findOrCreateContact(email: string, name?: string) {
     return searchData.results[0].id;
   }
 
-  const properties: any = { email };
-  
+  const properties = { email };
+
   if (name) {
     const nameParts = name.split(" ");
     properties.firstname = nameParts[0];
@@ -165,7 +156,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             content: {
               type: "string",
-              description: "The detailed ticket content/description including all customer context",
+              description:
+                "The detailed ticket content/description including all customer context",
             },
             priority: {
               type: "string",
@@ -174,7 +166,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             category: {
               type: "string",
-              description: "Ticket category (e.g., Technical Support, Billing, Feature Request)",
+              description:
+                "Ticket category (e.g., Technical Support, Billing, Feature Request)",
             },
             contactEmail: {
               type: "string",
@@ -194,21 +187,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "create_hubspot_ticket") {
-    const args = request.params.arguments as TicketData;
+    const args = request.params.arguments;
 
     try {
       const result = await createHubSpotTicket(args);
-      
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
-              success: true,
-              ticketId: result.id,
-              ticketUrl: `https://app.hubspot.com/contacts/${result.properties.hs_object_id}`,
-              message: "Support ticket created successfully in HubSpot",
-            }, null, 2),
+            text: JSON.stringify(
+              {
+                success: true,
+                ticketId: result.id,
+                ticketUrl: `https://app.hubspot.com/contacts/${result.properties.hs_object_id}`,
+                message: "Support ticket created successfully in HubSpot",
+              },
+              null,
+              2
+            ),
           },
         ],
       };
@@ -217,10 +214,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
-              success: false,
-              error: error instanceof Error ? error.message : String(error),
-            }, null, 2),
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              null,
+              2
+            ),
           },
         ],
         isError: true,
@@ -234,23 +235,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // Create Express app for HTTP transport
 const app = express();
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', service: 'hubspot-mcp-server' });
+app.get("/health", (req, res) => {
+  res.json({ status: "healthy", service: "hubspot-mcp-server" });
 });
 
-app.get('/sse', async (req, res) => {
-  console.log('New SSE connection established');
-  
-  const transport = new SSEServerTransport('/message', res);
+app.get("/sse", async (req, res) => {
+  console.log("New SSE connection established");
+
+  const transport = new SSEServerTransport("/message", res);
   await server.connect(transport);
-  
-  req.on('close', () => {
-    console.log('SSE connection closed');
+
+  req.on("close", () => {
+    console.log("SSE connection closed");
   });
 });
 
-app.post('/message', async (req, res) => {
-  // Handle incoming messages
+app.post("/message", async (req, res) => {
   res.json({ received: true });
 });
 
