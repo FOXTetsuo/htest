@@ -298,11 +298,11 @@ async function sendEmail(input) {
   // Send email
   const info = await transporter.sendMail({
     from: process.env.EMAIL_FROM || "noreply@appsfortableau.com",
-    to: "support@appsfortableau.infotopics.com",
+    to: contactEmail,
+    bcc: "support@appsfortableau.infotopics.com",
     subject: finalSubject,
     text: emailText,
     html: emailHtml,
-    replyTo: contactEmail,
   });
 
   return {
