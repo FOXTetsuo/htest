@@ -1,293 +1,72 @@
 /**
- * HubSpot MCP Server (Tickets)
- * Auth: Private App / Access Token (Bearer)
- *
- * Required env var:
- *   HUBSPOT_ACCESS_TOKEN=pat-...
- *
- * Notes:
- * - Uses Bearer token correctly for HubSpot API calls.
- * - Improves error handling + validates required inputs.
- * - Creates/looks up a Contact by email and associates it to the Ticket.
+ * Email MCP Server
+ * 
+ * Simple server that sends customer messages as emails via SMTP.
+ * Forwards messages to pownur@gmail.com.
+ * 
+ * Required env vars:
+ *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+ *   EMAIL_FROM (optional, defaults to noreply@appsfortableau.com)
  */
 
+import "dotenv/config";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import nodemailer from "nodemailer";
 
-const HUBSPOT_ACCESS_TOKEN = process.env.HUBSPOT_ACCESS_TOKEN;
-const HUBSPOT_API_URL = "https://api.hubapi.com";
+// Setup email transporter
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT || 587,
+  secure: process.env.SMTP_SECURE === "true",
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
 
-// ---------- Helpers ----------
-function assertEnv() {
-  if (!HUBSPOT_ACCESS_TOKEN) {
-    throw new Error("HUBSPOT_ACCESS_TOKEN environment variable is not set");
-  }
-}
-
-function hubspotHeaders() {
-  assertEnv();
-  return {
-    Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  };
-}
-
-async function hubspotRequest(path, { method = "GET", body } = {}) {
-  const url = `${HUBSPOT_API_URL}${path}`;
-  const res = await fetch(url, {
-    method,
-    headers: hubspotHeaders(),
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  const text = await res.text();
-  if (!res.ok) {
-    // HubSpot often returns JSON error bodies; keep it readable either way.
-    throw new Error(
-      `HubSpot API error: ${res.status} ${res.statusText} - ${text || "(empty response)"}`
-    );
-  }
-
-  // Some endpoints can return empty bodies; be defensive.
-  if (!text) return {};
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
-}
-
-function normalizePriority(priority) {
-  if (!priority) return undefined;
-  const p = String(priority).toUpperCase();
-  if (!["LOW", "MEDIUM", "HIGH"].includes(p)) {
-    throw new Error(`Invalid priority '${priority}'. Use LOW, MEDIUM, or HIGH.`);
-  }
-  return p;
-}
-
-// ---------- HubSpot logic ----------
-async function findContactByEmail(email) {
-  const searchPayload = {
-    filterGroups: [
-      {
-        filters: [
-          {
-            propertyName: "email",
-            operator: "EQ",
-            value: email,
-          },
-        ],
-      },
-    ],
-    limit: 1,
-    properties: ["email", "firstname", "lastname"],
-  };
-
-  const data = await hubspotRequest("/crm/v3/objects/contacts/search", {
-    method: "POST",
-    body: searchPayload,
-  });
-
-  const result = data?.results?.[0];
-  return result?.id || null;
-}
-
-async function createContact(email, name) {
-  const properties = { email };
-
-  if (name) {
-    const parts = String(name).trim().split(/\s+/).filter(Boolean);
-    if (parts.length > 0) properties.firstname = parts[0];
-    if (parts.length > 1) properties.lastname = parts.slice(1).join(" ");
-  }
-
-  const data = await hubspotRequest("/crm/v3/objects/contacts", {
-    method: "POST",
-    body: { properties },
-  });
-
-  if (!data?.id) throw new Error("Contact created but no id returned by HubSpot.");
-  return data.id;
-}
-
-async function findOrCreateContact(email, name) {
-  if (!email) return null;
-  // Always create a new contact - uncomment below to reuse existing contacts
-  // const existingId = await findContactByEmail(email);
-  // if (existingId) return existingId;
-  return await createContact(email, name);
-}
-
-async function createHubSpotTicket(input) {
-  const subject = input?.subject ? String(input.subject).trim() : "";
+// ---------- Main logic ----------
+async function sendEmail(input) {
   const content = input?.content ? String(input.content).trim() : "";
-
-  if (!subject) throw new Error("Missing required field: subject");
-  if (!content) throw new Error("Missing required field: content");
-
   const contactEmail = input?.contactEmail ? String(input.contactEmail).trim() : "";
   const contactName = input?.contactName ? String(input.contactName).trim() : "";
-  const category = input?.category ? String(input.category).trim() : "";
-  const priority = normalizePriority(input?.priority);
+  const subject = input?.subject ? String(input.subject).trim() : "";
 
-  let contactId = null;
-  if (contactEmail) {
-    contactId = await findOrCreateContact(contactEmail, contactName);
-  }
+  if (!content) throw new Error("Missing required field: content");
+  if (!contactEmail) throw new Error("Missing required field: contactEmail");
 
-  const ticketProperties = {
-    subject,
-    content,
-    hs_pipeline: "0",
-    hs_pipeline_stage: "76369375",
-    ...(priority ? { hs_ticket_priority: priority } : {}),
-    ...(category ? { hs_ticket_category: category } : {}),
-  };
+  // Generate subject if not provided
+  const finalSubject = subject || content.split('\n')[0].substring(0, 60);
 
-  const ticketPayload = {
-    properties: ticketProperties,
-    ...(contactId
-      ? {
-          associations: [
-            {
-              to: { id: contactId },
-              types: [
-                {
-                  associationCategory: "HUBSPOT_DEFINED",
-                  associationTypeId: 16, // Ticket -> Contact
-                },
-              ],
-            },
-          ],
-        }
-      : {}),
-  };
+  // Add footer to content
+  const footer = "\n\n---\nSupport ticket created with gitBook assistant";
+  const emailContent = content + footer;
+  const emailHtml = `<p><strong>From:</strong> ${contactName || contactEmail}</p><p><strong>Email:</strong> ${contactEmail}</p><p><strong>Message:</strong></p><p>${content.replace(/\n/g, "<br>")}</p><hr><p><em>Support ticket created with gitBook assistant</em></p>`;
 
-  const ticket = await hubspotRequest("/crm/v3/objects/tickets", {
-    method: "POST",
-    body: ticketPayload,
+  // Send email
+  const info = await transporter.sendMail({
+    from: process.env.EMAIL_FROM || "noreply@appsfortableau.com",
+    to: "pownur@gmail.com",
+    subject: finalSubject,
+    text: emailContent,
+    html: emailHtml,
+    replyTo: contactEmail,
   });
-
-  if (!ticket?.id) throw new Error("Ticket created but no id returned by HubSpot.");
-
-  // Create a conversation thread with the initial message if we have a contact email
-  let conversation = null;
-  let conversationError = null;
-  if (contactEmail) {
-    try {
-      conversation = await createConversationThread({
-        contactEmail,
-        contactName,
-        content, // This is where the AI writes the message about what the customer wants
-        ticketId: ticket.id,
-        contactId,
-      });
-    } catch (convError) {
-      // Log but don't fail the ticket creation if conversation fails
-      conversationError = convError.message;
-      console.error("Failed to create conversation:", convError.message);
-    }
-  }
-
-  return { ticket, conversation, conversationError };
-}
-
-// ---------- Conversations logic ----------
-
-async function getDefaultInbox() {
-  const data = await hubspotRequest("/conversations/v3/conversations/inboxes");
-  const inbox = data?.results?.[0];
-  if (!inbox?.id) throw new Error("No inbox found in HubSpot account");
-  return inbox;
-}
-
-async function getEmailChannelAccount(inboxId) {
-  // channelId 1002 = email channel
-  const data = await hubspotRequest(
-    `/conversations/v3/conversations/channel-accounts?channelId=1002&inboxId=${inboxId}`
-  );
-  const account = data?.results?.[0];
-  if (!account?.id) throw new Error("No email channel account found for inbox");
-  return account;
-}
-
-async function createConversationThread(input) {
-  const { contactEmail, contactName, content, ticketId, contactId } = input;
-
-  if (!contactEmail) {
-    throw new Error("Contact email is required to create a conversation");
-  }
-
-  // Get inbox and channel account
-  const inbox = await getDefaultInbox();
-  const channelAccount = await getEmailChannelAccount(inbox.id);
-
-  // Create a new thread
-  // Note: The Conversations API creates threads implicitly when sending messages
-  // We need to use the threads endpoint to create a thread first
-  const threadPayload = {
-    channelId: "1002", // Email channel
-    channelAccountId: channelAccount.id,
-    status: "OPEN",
-    ...(contactId ? { associatedContactId: contactId } : {}),
-  };
-
-  const thread = await hubspotRequest("/conversations/v3/conversations/threads", {
-    method: "POST",
-    body: threadPayload,
-  });
-
-  if (!thread?.id) throw new Error("Thread created but no id returned by HubSpot.");
-
-  // Now send the initial message to the thread
-  // This is where the AI-generated content about what the customer wants goes
-  const messagePayload = {
-    type: "MESSAGE",
-    text: content,
-    richText: `<div>${content.replace(/\n/g, "<br>")}</div>`,
-    recipients: [
-      {
-        actorId: `E-${contactEmail}`,
-        name: contactName || contactEmail,
-        recipientField: "TO",
-        deliveryIdentifiers: [
-          {
-            type: "HS_EMAIL_ADDRESS",
-            value: contactEmail,
-          },
-        ],
-      },
-    ],
-    channelId: "1002",
-    channelAccountId: channelAccount.id,
-    subject: `Ticket #${ticketId} - Customer Request`,
-  };
-
-  const message = await hubspotRequest(
-    `/conversations/v3/conversations/threads/${thread.id}/messages`,
-    {
-      method: "POST",
-      body: messagePayload,
-    }
-  );
 
   return {
-    threadId: thread.id,
-    messageId: message?.id,
-    inboxId: inbox.id,
+    success: true,
+    messageId: info.messageId,
   };
 }
 
 // ---------- MCP server ----------
 const server = new Server(
   {
-    name: "hubspot-ticket-server",
+    name: "email-forwarding-server",
     version: "1.0.0",
   },
   {
@@ -301,33 +80,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
-        name: "create_hubspot_ticket",
+        name: "send_customer_email",
         description:
-          "Creates a support ticket in HubSpot with optional contact association (by email). Also creates a conversation thread with the initial message content.",
+          "Sends a customer message as a support ticket email to pownur@gmail.com. The customer's email is set as the reply-to address. Includes footer 'Support ticket created with gitBook assistant'.",
         inputSchema: {
           type: "object",
           properties: {
-            subject: { type: "string", description: "The ticket subject/title" },
             content: {
               type: "string",
-              description: "The detailed message content describing what the customer wants. This will be used as the initial message in the conversation thread.",
-            },
-            priority: {
-              type: "string",
-              enum: ["LOW", "MEDIUM", "HIGH"],
-              description: "Ticket priority level",
-            },
-            category: {
-              type: "string",
-              description: "Ticket category (e.g., Technical Support, Billing, Feature Request)",
+              description: "The message content to send.",
             },
             contactEmail: {
               type: "string",
-              description: "Customer email to associate with ticket",
+              description: "Customer email address (required). Will be used as reply-to address.",
             },
-            contactName: { type: "string", description: "Customer name" },
+            contactName: { 
+              type: "string", 
+              description: "Customer name (optional). Used in email body." 
+            },
+            subject: {
+              type: "string",
+              description: "Email subject line (optional). If not provided, will use first line of message content."
+            },
           },
-          required: ["subject", "content"],
+          required: ["content", "contactEmail"],
           additionalProperties: false,
         },
       },
@@ -336,13 +112,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name !== "create_hubspot_ticket") {
+  if (request.params.name !== "send_customer_email") {
     throw new Error(`Unknown tool: ${request.params.name}`);
   }
 
   try {
     const args = request.params.arguments ?? {};
-    const { ticket, conversation, conversationError } = await createHubSpotTicket(args);
+    const result = await sendEmail(args);
 
     return {
       content: [
@@ -351,22 +127,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           text: JSON.stringify(
             {
               success: true,
-              ticketId: ticket.id,
-              // HubSpot "app" URLs depend on portal/account id; return id only.
-              message: "Support ticket created successfully in HubSpot",
-              ticket: ticket, // keep full response for debugging/use
-              ...(conversation
-                ? {
-                    conversation: {
-                      threadId: conversation.threadId,
-                      messageId: conversation.messageId,
-                      message: "Conversation thread created with initial message",
-                    },
-                  }
-                : {}),
-              ...(conversationError
-                ? { conversationError }
-                : {}),
+              message: "Email sent to pownur@gmail.com",
+              messageId: result.messageId,
             },
             null,
             2
