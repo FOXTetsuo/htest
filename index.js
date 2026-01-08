@@ -432,7 +432,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: JSON.stringify(
               {
                 success: true,
-                message: "Email sent to pownur@gmail.com",
+                message: "An email has been sent to the Apps for Tableau support team. You will get a copy in your inbox. We will get back to you ASAP!",
                 messageId: result.messageId,
               },
               null,
