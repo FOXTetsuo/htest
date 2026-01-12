@@ -3,10 +3,12 @@
  * 
  * Sends customer support emails to HubSpot Conversations inbox via forwarding.
  * Emails are sent to customer with HubSpot inbox BCC'd for ticket creation.
+ * Sends webhook payloads to trigger internal comment automation.
  * 
  * Required env vars:
  *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
  *   HUBSPOT_BCC_EMAIL (the hosted email, e.g., support@youraccount.hs-inbox.com)
+ *   WEBHOOK_PORT (optional, enable incoming webhook listener)
  */
 
 import "dotenv/config";
@@ -16,6 +18,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import express from "express";
 import nodemailer from "nodemailer";
 
 const transporter = nodemailer.createTransport({
@@ -27,6 +30,32 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS,
   },
 });
+
+const HUBSPOT_WEBHOOK_URL =
+  "https://api-eu1.hubapi.com/automation/v4/webhook-triggers/25291663/Fpc2iX3";
+
+function buildInternalComment(contactName, contactEmail) {
+  const name = contactName || "Unknown";
+  const email = contactEmail || "Unknown";
+  return (
+    "This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:\n" +
+    `Name: ${name}\n` +
+    `Email: ${email}`
+  );
+}
+
+async function triggerHubspotWebhook(payload) {
+  const response = await fetch(HUBSPOT_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`HubSpot webhook error ${response.status}: ${errorBody}`);
+  }
+}
 
 function analyzeConversationForSupport(conversationHistory) {
   if (!conversationHistory || conversationHistory.length === 0) {
@@ -193,8 +222,6 @@ async function sendEmail(input) {
     throw new Error("HUBSPOT_BCC_EMAIL not configured (e.g., support@youraccount.hs-inbox.com)");
   }
 
-  const hubspotContactId = null;
-
   const finalSubject = subject || content.split('\n')[0].substring(0, 60);
 
   let emailText = "";
@@ -283,33 +310,21 @@ async function sendEmail(input) {
   });
 
   const internalContactName = contactName || contactEmail;
+  const internalCommentText = buildInternalComment(internalContactName, contactEmail);
 
-  const webhookResponse = await fetch(
-    "https://api-eu1.hubapi.com/automation/v4/webhook-triggers/25291663/HdHe9MJ",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contactName: internalContactName,
-        contactEmail,
-        subject: finalSubject,
-        messageId: info.messageId,
-        webhookEmail: process.env.SMTP_USER
-      }),
-    }
-  );
-
-  if (!webhookResponse.ok) {
-    const errorBody = await webhookResponse.text();
-    throw new Error(`HubSpot webhook error ${webhookResponse.status}: ${errorBody}`);
-  }
+  await triggerHubspotWebhook({
+    contactName: internalContactName,
+    contactEmail,
+    subject: finalSubject,
+    messageId: info.messageId,
+    internalComment: internalCommentText,
+  });
 
 
 
   return {
     success: true,
     messageId: info.messageId,
-    hubspotContactId: hubspotContactId,
     forwardedTo: hubspotBccEmail,
     webhookTriggered: true,
   };
@@ -372,7 +387,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             contactName: { 
               type: "string", 
-              description: "Customer name (optional). Used in email body." 
+              description: "Customer name (optional). Used in the webhook payload." 
             },
             subject: {
               type: "string",
@@ -438,7 +453,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 success: true,
                 message: "Your support request has been sent to the Apps for Tableau support team. We will get back to you ASAP!",
                 messageId: result.messageId,
-                hubspotContactId: result.hubspotContactId,
                 forwardedTo: result.forwardedTo,
                 webhookTriggered: result.webhookTriggered,
               },
@@ -475,6 +489,39 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("HubSpot MCP Server running on stdio");
+
+  const webhookPort = Number(process.env.WEBHOOK_PORT || process.env.PORT);
+  if (webhookPort) {
+    const app = express();
+    app.use(express.json({ limit: "1mb" }));
+
+    app.post(["/", "/webhook"], async (req, res) => {
+      const body = req.body && typeof req.body === "object" ? req.body : {};
+      const keys = Object.keys(body);
+      const hasOnlyThreadId = keys.length === 1 && keys[0] === "hs_thread_id";
+
+      if (!hasOnlyThreadId) {
+        res.status(204).end();
+        return;
+      }
+
+      try {
+        const internalCommentText = buildInternalComment(null, null);
+        await triggerHubspotWebhook({
+          hs_thread_id: body.hs_thread_id,
+          internalComment: internalCommentText,
+        });
+        res.status(200).json({ success: true });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        res.status(500).json({ success: false, error: message });
+      }
+    });
+
+    app.listen(webhookPort, () => {
+      console.error(`Webhook listener running on port ${webhookPort}`);
+    });
+  }
 }
 
 main().catch((error) => {
