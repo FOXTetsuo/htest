@@ -7,8 +7,6 @@
  * Required env vars:
  *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
  *   HUBSPOT_BCC_EMAIL (the hosted email, e.g., support@youraccount.hs-inbox.com)
- *   HUBSPOT_ACCESS_TOKEN (private app token with conversations.write)
- *   HUBSPOT_INBOX_ID (numeric inbox ID for thread lookup)
  */
 
 import "dotenv/config";
@@ -29,84 +27,6 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS,
   },
 });
-
-function toTimestamp(value) {
-  if (typeof value === "number") return value;
-  if (typeof value === "string") {
-    const asNumber = Number(value);
-    if (!Number.isNaN(asNumber)) return asNumber;
-    const parsed = Date.parse(value);
-    return Number.isNaN(parsed) ? 0 : parsed;
-  }
-  return 0;
-}
-
-function pickMostRecentThread(threads) {
-  if (!threads.length) return null;
-  return [...threads].sort((a, b) => {
-    const aTs = toTimestamp(a.latestMessageTimestamp || a.updatedAt || a.createdAt);
-    const bTs = toTimestamp(b.latestMessageTimestamp || b.updatedAt || b.createdAt);
-    return bTs - aTs;
-  })[0];
-}
-
-function pickThreadBySubject(threads, subject) {
-  if (!subject) return pickMostRecentThread(threads);
-  const normalizedSubject = subject.toLowerCase();
-  const subjectMatches = threads.filter((thread) => {
-    const threadSubject = typeof thread.subject === "string" ? thread.subject.toLowerCase() : "";
-    return threadSubject.includes(normalizedSubject);
-  });
-  return pickMostRecentThread(subjectMatches.length ? subjectMatches : threads);
-}
-
-async function hubspotRequest(path, { method = "GET", body } = {}) {
-  const hubspotAccessToken = process.env.HUBSPOT_ACCESS_TOKEN;
-  if (!hubspotAccessToken) {
-    throw new Error("HUBSPOT_ACCESS_TOKEN not configured");
-  }
-
-  const response = await fetch(`https://api.hubapi.com${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${hubspotAccessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`HubSpot API error ${response.status}: ${errorBody}`);
-  }
-
-  return response.json();
-}
-
-async function findThreadIdByInbox({ inboxId, latestMessageTimestampAfter, subject }) {
-  const params = new URLSearchParams({
-    inboxId: String(inboxId),
-    sort: "latestMessageTimestamp",
-    latestMessageTimestampAfter: String(latestMessageTimestampAfter),
-    limit: "20",
-  });
-
-  const data = await hubspotRequest(`/conversations/v3/conversations/threads?${params.toString()}`);
-  const threads = Array.isArray(data.results) ? data.results : [];
-  const thread = pickThreadBySubject(threads, subject);
-  return thread?.id || null;
-}
-
-async function postInternalComment({ threadId, text, richText }) {
-  return hubspotRequest(`/conversations/v3/conversations/threads/${threadId}/messages`, {
-    method: "POST",
-    body: {
-      type: "COMMENT",
-      text,
-      richText,
-    },
-  });
-}
 
 function analyzeConversationForSupport(conversationHistory) {
   if (!conversationHistory || conversationHistory.length === 0) {
@@ -272,13 +192,6 @@ async function sendEmail(input) {
   if (!hubspotBccEmail) {
     throw new Error("HUBSPOT_BCC_EMAIL not configured (e.g., support@youraccount.hs-inbox.com)");
   }
-  const hubspotInboxId = process.env.HUBSPOT_INBOX_ID;
-  if (!hubspotInboxId) {
-    throw new Error("HUBSPOT_INBOX_ID not configured");
-  }
-  if (!process.env.HUBSPOT_ACCESS_TOKEN) {
-    throw new Error("HUBSPOT_ACCESS_TOKEN not configured");
-  }
 
   const hubspotContactId = null;
 
@@ -359,7 +272,6 @@ async function sendEmail(input) {
 
   emailText += "\n\n---\nSupport ticket created with GitBook assistant";
 
-  const emailSentAt = Date.now();
   const info = await transporter.sendMail({
     from: process.env.SMTP_USER,
     replyTo: contactEmail,
@@ -371,43 +283,26 @@ async function sendEmail(input) {
   });
 
   const internalContactName = contactName || contactEmail;
-  const internalCommentText =
-    "This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:\n" +
-    `Name: ${internalContactName}\n` +
-    `Email: ${contactEmail}`;
-  const internalCommentHtml = `<div style="font-family: Arial, sans-serif;">
-    <p>This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:</p>
-    <p><strong>Name:</strong> ${internalContactName}<br><strong>Email:</strong> ${contactEmail}</p>
-  </div>`;
 
-  const pollAttempts = Number(process.env.HUBSPOT_THREAD_POLL_ATTEMPTS || 5);
-  const pollIntervalMs = Number(process.env.HUBSPOT_THREAD_POLL_INTERVAL_MS || 3000);
-  const lookbackMs = Number(process.env.HUBSPOT_THREAD_LOOKBACK_MS || 10 * 60 * 1000);
-  const latestMessageTimestampAfter = emailSentAt - lookbackMs;
-
-  let threadId = null;
-  for (let attempt = 0; attempt < pollAttempts; attempt += 1) {
-    threadId = await findThreadIdByInbox({
-      inboxId: hubspotInboxId,
-      latestMessageTimestampAfter,
-      subject: finalSubject,
-    });
-
-    if (threadId) break;
-    if (attempt < pollAttempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  const webhookResponse = await fetch(
+    "https://api-eu1.hubapi.com/automation/v4/webhook-triggers/25291663/HdHe9MJ",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contactName: internalContactName,
+        contactEmail,
+        subject: finalSubject,
+        messageId: info.messageId,
+        webhookEmail: process.env.SMTP_USER
+      }),
     }
-  }
+  );
 
-  if (!threadId) {
-    throw new Error("Unable to locate HubSpot thread for internal comment");
+  if (!webhookResponse.ok) {
+    const errorBody = await webhookResponse.text();
+    throw new Error(`HubSpot webhook error ${webhookResponse.status}: ${errorBody}`);
   }
-
-  await postInternalComment({
-    threadId,
-    text: internalCommentText,
-    richText: internalCommentHtml,
-  });
 
 
 
@@ -416,7 +311,7 @@ async function sendEmail(input) {
     messageId: info.messageId,
     hubspotContactId: hubspotContactId,
     forwardedTo: hubspotBccEmail,
-    hubspotThreadId: threadId,
+    webhookTriggered: true,
   };
 }
 
@@ -545,7 +440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 messageId: result.messageId,
                 hubspotContactId: result.hubspotContactId,
                 forwardedTo: result.forwardedTo,
-                hubspotThreadId: result.hubspotThreadId,
+                webhookTriggered: result.webhookTriggered,
               },
               null,
               2
