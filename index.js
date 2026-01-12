@@ -1,12 +1,14 @@
 /**
  * Email MCP Server
  * 
- * Simple server that sends customer messages as emails via SMTP.
- * Forwards messages to pownur@gmail.com.
+ * Sends customer support emails to HubSpot Conversations inbox via forwarding.
+ * Emails are sent to customer with HubSpot inbox BCC'd for ticket creation.
  * 
  * Required env vars:
  *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
- *   EMAIL_FROM (optional, defaults to noreply@appsfortableau.com)
+ *   HUBSPOT_BCC_EMAIL (the hosted email, e.g., support@youraccount.hs-inbox.com)
+ *   HUBSPOT_ACCESS_TOKEN (private app token with conversations.write)
+ *   HUBSPOT_INBOX_ID (numeric inbox ID for thread lookup)
  */
 
 import "dotenv/config";
@@ -18,7 +20,6 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import nodemailer from "nodemailer";
 
-// Setup email transporter
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: process.env.SMTP_PORT || 587,
@@ -29,7 +30,84 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// ---------- Conversation analysis ----------
+function toTimestamp(value) {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const asNumber = Number(value);
+    if (!Number.isNaN(asNumber)) return asNumber;
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
+}
+
+function pickMostRecentThread(threads) {
+  if (!threads.length) return null;
+  return [...threads].sort((a, b) => {
+    const aTs = toTimestamp(a.latestMessageTimestamp || a.updatedAt || a.createdAt);
+    const bTs = toTimestamp(b.latestMessageTimestamp || b.updatedAt || b.createdAt);
+    return bTs - aTs;
+  })[0];
+}
+
+function pickThreadBySubject(threads, subject) {
+  if (!subject) return pickMostRecentThread(threads);
+  const normalizedSubject = subject.toLowerCase();
+  const subjectMatches = threads.filter((thread) => {
+    const threadSubject = typeof thread.subject === "string" ? thread.subject.toLowerCase() : "";
+    return threadSubject.includes(normalizedSubject);
+  });
+  return pickMostRecentThread(subjectMatches.length ? subjectMatches : threads);
+}
+
+async function hubspotRequest(path, { method = "GET", body } = {}) {
+  const hubspotAccessToken = process.env.HUBSPOT_ACCESS_TOKEN;
+  if (!hubspotAccessToken) {
+    throw new Error("HUBSPOT_ACCESS_TOKEN not configured");
+  }
+
+  const response = await fetch(`https://api.hubapi.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${hubspotAccessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`HubSpot API error ${response.status}: ${errorBody}`);
+  }
+
+  return response.json();
+}
+
+async function findThreadIdByInbox({ inboxId, latestMessageTimestampAfter, subject }) {
+  const params = new URLSearchParams({
+    inboxId: String(inboxId),
+    sort: "latestMessageTimestamp",
+    latestMessageTimestampAfter: String(latestMessageTimestampAfter),
+    limit: "20",
+  });
+
+  const data = await hubspotRequest(`/conversations/v3/conversations/threads?${params.toString()}`);
+  const threads = Array.isArray(data.results) ? data.results : [];
+  const thread = pickThreadBySubject(threads, subject);
+  return thread?.id || null;
+}
+
+async function postInternalComment({ threadId, text, richText }) {
+  return hubspotRequest(`/conversations/v3/conversations/threads/${threadId}/messages`, {
+    method: "POST",
+    body: {
+      type: "COMMENT",
+      text,
+      richText,
+    },
+  });
+}
+
 function analyzeConversationForSupport(conversationHistory) {
   if (!conversationHistory || conversationHistory.length === 0) {
     return { action: "no_action", reason: "No conversation history provided" };
@@ -37,7 +115,6 @@ function analyzeConversationForSupport(conversationHistory) {
 
   const lastMessages = conversationHistory.slice(-4).map(m => m.content.toLowerCase());
   
-  // Check if customer explicitly asked for support
   const explicitSupportRequest = lastMessages.some(msg => 
     /support|agent|speak with|contact|help team|representative|specialist|support ticket/.test(msg)
   );
@@ -50,7 +127,6 @@ function analyzeConversationForSupport(conversationHistory) {
     };
   }
 
-  // Check if customer said the answer didn't help (negative response)
   const negativeResponse = lastMessages.some(msg =>
     /^(no|didn't help|doesn't work|still broken|still doesn't|nope|nah|didn't solve|doesn't solve)/.test(msg) ||
     /didn't (help|work|solve)|doesn't (help|work|solve)|not (helpful|working)|still (broken|failing|doesn't)/.test(msg)
@@ -64,7 +140,6 @@ function analyzeConversationForSupport(conversationHistory) {
     };
   }
 
-  // Check for signs of confusion, errors, or unresolved issues
   const confusionOrError = lastMessages.some(msg =>
     /error|failed|broken|stuck|confused|not sure|unclear|doesn't show|missing|not (working|appearing)|crash|freeze|hang/.test(msg)
   );
@@ -77,7 +152,6 @@ function analyzeConversationForSupport(conversationHistory) {
     };
   }
 
-  // Check if customer seems unsure after explanation
   const uncertainResponse = lastMessages.some(msg =>
     /\?$|what if|what about|how do i|can't figure|not clear|still don't|what do you mean|don't understand|what's|how's/.test(msg)
   );
@@ -90,7 +164,6 @@ function analyzeConversationForSupport(conversationHistory) {
     };
   }
 
-  // Check if customer said yes or seems satisfied
   const positiveResponse = lastMessages.some(msg =>
     /^(yes|yep|yeah|yup|thanks|that works|solved|fixed|great|perfect|ok|good)/.test(msg) ||
     /works|solved|fixed|helpful|thanks/.test(msg)
@@ -104,7 +177,6 @@ function analyzeConversationForSupport(conversationHistory) {
     };
   }
 
-  // Default: offer ticket if conversation has gone back and forth
   if (conversationHistory.length >= 5) {
     return {
       action: "offer_ticket",
@@ -125,7 +197,6 @@ function extractCustomerInfo(conversationHistory) {
     return { email: null, name: null, version: null, platform: null };
   }
 
-  // Look for email pattern in conversation
   const emailPattern = /([a-zA-Z0-9._%-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
   let email = null;
   let name = null;
@@ -135,27 +206,21 @@ function extractCustomerInfo(conversationHistory) {
   for (const message of conversationHistory) {
     const content = message.content;
     
-    // Extract email
     if (!email) {
       const emailMatch = content.match(emailPattern);
       if (emailMatch) email = emailMatch[0];
     }
 
-    // Extract name (first message from customer often contains it)
     if (!name && message.role === "user") {
-      // Try common patterns like "I'm [name]" or "My name is [name]"
       const nameMatch = content.match(/(?:i'?m|my name is|this is|call me|i'm called)\s+([A-Z][a-z]+)/i);
       if (nameMatch) name = nameMatch[1];
     }
 
-    // Extract version
     if (!version) {
-      // Match version patterns like "1.2.3", "v1.2", "version 1.2", etc.
       const versionMatch = content.match(/(?:version|v\.?)\s*(\d+(?:\.\d+)*)|(\d+\.\d+(?:\.\d+)?)/i);
       if (versionMatch) version = versionMatch[1] || versionMatch[2];
     }
 
-    // Extract platform
     if (!platform) {
       if (/\bwindows\b/i.test(content)) {
         platform = "Windows";
@@ -172,12 +237,10 @@ function extractCustomerInfo(conversationHistory) {
   return { email, name, version, platform };
 }
 
-// ---------- Main logic ----------
 async function evaluateConversationForSupport(conversationHistory) {
   const analysis = analyzeConversationForSupport(conversationHistory);
   const customerInfo = extractCustomerInfo(conversationHistory);
 
-  // Determine which fields are missing
   const missingFields = [];
   if (!customerInfo.email) missingFields.push("email");
   if (!customerInfo.name) missingFields.push("name");
@@ -205,20 +268,28 @@ async function sendEmail(input) {
   if (!content) throw new Error("Missing required field: content");
   if (!contactEmail) throw new Error("Missing required field: contactEmail");
 
-  // Generate subject if not provided
+  const hubspotBccEmail = process.env.HUBSPOT_BCC_EMAIL;
+  if (!hubspotBccEmail) {
+    throw new Error("HUBSPOT_BCC_EMAIL not configured (e.g., support@youraccount.hs-inbox.com)");
+  }
+  const hubspotInboxId = process.env.HUBSPOT_INBOX_ID;
+  if (!hubspotInboxId) {
+    throw new Error("HUBSPOT_INBOX_ID not configured");
+  }
+  if (!process.env.HUBSPOT_ACCESS_TOKEN) {
+    throw new Error("HUBSPOT_ACCESS_TOKEN not configured");
+  }
+
+  const hubspotContactId = null;
+
   const finalSubject = subject || content.split('\n')[0].substring(0, 60);
 
-  // Build structured email body
-  let emailText = `Customer: ${contactName || contactEmail}\n`;
-  emailText += `Email: ${contactEmail}\n`;
-  if (platform) emailText += `Platform: ${platform}\n`;
-  emailText += `\n`;
+  let emailText = "";
+  if (platform) emailText += `Platform: ${platform}\n\n`;
 
-  // Product header
   const productInfo = productName ? `${productName}${version ? ' ' + version : ''}` : (version ? `version ${version}` : "the product");
   emailText += `Customer reported the following issue with ${productInfo}:\n\n`;
   
-  // Parse content to extract issues and suggestions
   const contentLines = content.split('\n');
   let inIssuesSection = false;
   let inSuggestionsSection = false;
@@ -243,7 +314,6 @@ async function sendEmail(input) {
     }
   }
 
-  // If no structured format found, use entire content as issue
   if (!issuesText && !suggestionsText) {
     issuesText = content;
   }
@@ -254,7 +324,6 @@ async function sendEmail(input) {
     emailText += `\n\nI suggested the following fixes from the documentation:\n\n${suggestionsText}`;
   }
 
-  // Format conversation history
   if (conversationHistory && conversationHistory.length > 0) {
     emailText += "\n\n--- Conversation History ---\n";
     
@@ -266,10 +335,7 @@ async function sendEmail(input) {
     emailText += "\n--- End Conversation ---";
   }
 
-  // HTML version
   let emailHtml = `<div style="font-family: Arial, sans-serif;">`;
-  emailHtml += `<p><strong>Customer:</strong> ${contactName || contactEmail}</p>`;
-  emailHtml += `<p><strong>Email:</strong> ${contactEmail}</p>`;
   if (platform) emailHtml += `<p><strong>Platform:</strong> ${platform}</p>`;
   emailHtml += `<hr>`;
   emailHtml += `<h3>Customer reported the following issue with ${productInfo}:</h3>`;
@@ -280,7 +346,6 @@ async function sendEmail(input) {
     emailHtml += `<div style="margin: 15px 0;">${suggestionsText.replace(/\n/g, "<br>")}</div>`;
   }
 
-  // Add conversation history to HTML
   if (conversationHistory && conversationHistory.length > 0) {
     emailHtml += `<hr><h3>Conversation History</h3>`;
     conversationHistory.forEach((msg) => {
@@ -292,22 +357,66 @@ async function sendEmail(input) {
 
   emailHtml += `<hr><p style="color: #666;"><em>Support ticket created with GitBook assistant</em></p></div>`;
 
-  // Add footer to text version
   emailText += "\n\n---\nSupport ticket created with GitBook assistant";
 
-  // Send email
+  const emailSentAt = Date.now();
   const info = await transporter.sendMail({
-    from: process.env.EMAIL_FROM || "noreply@appsfortableau.com",
+    from: process.env.SMTP_USER,
+    replyTo: contactEmail,
     to: contactEmail,
-    bcc: "support@appsfortableau.infotopics.com",
+    bcc: hubspotBccEmail,
     subject: finalSubject,
     text: emailText,
     html: emailHtml,
   });
 
+  const internalContactName = contactName || contactEmail;
+  const internalCommentText =
+    "This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:\n" +
+    `Name: ${internalContactName}\n` +
+    `Email: ${contactEmail}`;
+  const internalCommentHtml = `<div style="font-family: Arial, sans-serif;">
+    <p>This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:</p>
+    <p><strong>Name:</strong> ${internalContactName}<br><strong>Email:</strong> ${contactEmail}</p>
+  </div>`;
+
+  const pollAttempts = Number(process.env.HUBSPOT_THREAD_POLL_ATTEMPTS || 5);
+  const pollIntervalMs = Number(process.env.HUBSPOT_THREAD_POLL_INTERVAL_MS || 3000);
+  const lookbackMs = Number(process.env.HUBSPOT_THREAD_LOOKBACK_MS || 10 * 60 * 1000);
+  const latestMessageTimestampAfter = emailSentAt - lookbackMs;
+
+  let threadId = null;
+  for (let attempt = 0; attempt < pollAttempts; attempt += 1) {
+    threadId = await findThreadIdByInbox({
+      inboxId: hubspotInboxId,
+      latestMessageTimestampAfter,
+      subject: finalSubject,
+    });
+
+    if (threadId) break;
+    if (attempt < pollAttempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+  }
+
+  if (!threadId) {
+    throw new Error("Unable to locate HubSpot thread for internal comment");
+  }
+
+  await postInternalComment({
+    threadId,
+    text: internalCommentText,
+    richText: internalCommentHtml,
+  });
+
+
+
   return {
     success: true,
     messageId: info.messageId,
+    hubspotContactId: hubspotContactId,
+    forwardedTo: hubspotBccEmail,
+    hubspotThreadId: threadId,
   };
 }
 
@@ -354,7 +463,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "send_customer_email",
         description:
-          "Sends a customer message as a support ticket email to pownur@gmail.com. The customer's email is set as the reply-to address. Includes footer 'Support ticket created with gitBook assistant'.",
+          "Sends a customer support email to the customer while BCC'ing the HubSpot Conversations inbox for ticket creation.",
         inputSchema: {
           type: "object",
           properties: {
@@ -364,7 +473,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             contactEmail: {
               type: "string",
-              description: "Customer email address (required). Will be used as reply-to address.",
+              description: "Customer email address (required). Will be used as the sender so HubSpot associates correctly to the customer contact.",
             },
             contactName: { 
               type: "string", 
@@ -387,15 +496,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             productName: {
               type: "string",
-              description: "Name of the product (e.g., 'MailScheduler', 'Writeback Extreme'). Used in email header."
+              description: "Name of the product (e.g., 'MailScheduler', 'Writeback Extreme'). Used in email header and HubSpot contact property."
             },
             version: {
               type: "string",
-              description: "Product version number (e.g., '1.2.3', '2.0'). Used in email header."
+              description: "Product version number (e.g., '1.2.3', '2.0'). Used in email header and HubSpot contact property."
             },
             platform: {
               type: "string",
-              description: "Operating system platform (e.g., 'Windows', 'Linux', 'macOS'). Displayed in email metadata."
+              description: "Operating system platform (e.g., 'Windows', 'Linux', 'macOS'). Displayed in email metadata and HubSpot contact property."
             },
           },
           required: ["content", "contactEmail"],
@@ -432,8 +541,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: JSON.stringify(
               {
                 success: true,
-                message: "An email has been sent to the Apps for Tableau support team. You will get a copy in your inbox. We will get back to you ASAP!",
+                message: "Your support request has been sent to the Apps for Tableau support team. We will get back to you ASAP!",
                 messageId: result.messageId,
+                hubspotContactId: result.hubspotContactId,
+                forwardedTo: result.forwardedTo,
+                hubspotThreadId: result.hubspotThreadId,
               },
               null,
               2
@@ -464,7 +576,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Use stdio transport for Claude Code / Claude Desktop
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
