@@ -4,10 +4,9 @@
  * Submits form data to HubSpot Forms API (legacy v3 endpoint).
  * Includes a preconfigured tool for the support form in portal 25291663.
  *
- * Required env vars (unless provided in tool input):
- *   HUBSPOT_PORTAL_ID, HUBSPOT_FORM_GUID
- * Optional env vars:
- *   HUBSPOT_FORMS_BASE_URL (e.g., https://api.hsforms.com or https://api-eu1.hsforms.com)
+ * Env vars:
+ *   HUBSPOT_PORTAL_ID, HUBSPOT_FORM_GUID, HUBSPOT_FORMS_BASE_URL
+ *   (used by the support form and file upload when set; otherwise defaults apply)
  */
 
 import "dotenv/config";
@@ -90,12 +89,10 @@ const SUPPORT_FORM = {
   subscriptionTypeIds: {
     confirmationEmails: 130256869,
     serviceSupport: 125387774,
-    productUpdates: 130256504,
   },
   consentTexts: {
     confirmationEmails: "I agree to receive confirmation emails about my requests",
     serviceSupport: "I agree to receive service/sales support",
-    productUpdates: "Subscribe for product updates and exclusive content",
   },
   consentToProcessText:
     "I agree to allow Apps for Tableau to store and process my personal data.",
@@ -277,12 +274,6 @@ function requireEnum(value, allowed, fieldLabel, aliases = {}) {
   return mapped;
 }
 
-function requireTrue(value, fieldLabel) {
-  if (value !== true) {
-    throw new Error(`Missing required consent: ${fieldLabel}`);
-  }
-}
-
 function normalizeFileUrls(fileUrlsInput) {
   if (!fileUrlsInput) return null;
   const urls = Array.isArray(fileUrlsInput) ? fileUrlsInput : [fileUrlsInput];
@@ -350,66 +341,25 @@ function buildSupportTicketFields(input) {
   return fields;
 }
 
-function buildSupportTicketConsent(input) {
-  requireTrue(input?.consentConfirmationEmails, "consentConfirmationEmails");
-  requireTrue(input?.consentServiceSupport, "consentServiceSupport");
-
-  const consentTexts = input?.consentTexts ?? {};
-  let consentToProcess = true;
-  if (typeof input?.consentToProcess === "boolean") {
-    requireTrue(input.consentToProcess, "consentToProcess");
-    consentToProcess = input.consentToProcess;
-  }
-  const consentToProcessText =
-    normalizeString(input?.consentToProcessText) || SUPPORT_FORM.consentToProcessText;
-
-  const communications = [
-    {
-      value: true,
-      subscriptionTypeId: SUPPORT_FORM.subscriptionTypeIds.confirmationEmails,
-      text: consentTexts.confirmationEmails || SUPPORT_FORM.consentTexts.confirmationEmails,
-    },
-    {
-      value: true,
-      subscriptionTypeId: SUPPORT_FORM.subscriptionTypeIds.serviceSupport,
-      text: consentTexts.serviceSupport || SUPPORT_FORM.consentTexts.serviceSupport,
-    },
-  ];
-
-  if (typeof input?.consentProductUpdates === "boolean") {
-    communications.push({
-      value: input.consentProductUpdates,
-      subscriptionTypeId: SUPPORT_FORM.subscriptionTypeIds.productUpdates,
-      text: consentTexts.productUpdates || SUPPORT_FORM.consentTexts.productUpdates,
-    });
-  }
-
+function buildSupportTicketConsent() {
   return {
     consent: {
-      consentToProcess,
-      text: consentToProcessText,
-      communications,
+      consentToProcess: true,
+      text: SUPPORT_FORM.consentToProcessText,
+      communications: [
+        {
+          value: true,
+          subscriptionTypeId: SUPPORT_FORM.subscriptionTypeIds.confirmationEmails,
+          text: SUPPORT_FORM.consentTexts.confirmationEmails,
+        },
+        {
+          value: true,
+          subscriptionTypeId: SUPPORT_FORM.subscriptionTypeIds.serviceSupport,
+          text: SUPPORT_FORM.consentTexts.serviceSupport,
+        },
+      ],
     },
   };
-}
-
-function buildSupportTicketContext(input) {
-  if (input?.context && typeof input.context === "object") {
-    return input.context;
-  }
-
-  const context = {};
-  const hutk = normalizeString(input?.hutk);
-  const pageUri = normalizeString(input?.pageUri);
-  const pageName = normalizeString(input?.pageName);
-  const ipAddress = normalizeString(input?.ipAddress);
-
-  if (hutk) context.hutk = hutk;
-  if (pageUri) context.pageUri = pageUri;
-  if (pageName) context.pageName = pageName;
-  if (ipAddress) context.ipAddress = ipAddress;
-
-  return Object.keys(context).length > 0 ? context : null;
 }
 
 function normalizeFields(fieldsInput) {
@@ -507,15 +457,12 @@ async function submitHubspotForm(input) {
 }
 
 async function submitSupportTicketForm(input) {
-  const portalId = input?.portalId || SUPPORT_FORM.portalId;
-  const formGuid = input?.formGuid || SUPPORT_FORM.formGuid;
-  const baseUrl = String(
-    input?.baseUrl || process.env.HUBSPOT_FORMS_BASE_URL || SUPPORT_FORM.defaultBaseUrl
-  );
+  const portalId = process.env.HUBSPOT_PORTAL_ID || SUPPORT_FORM.portalId;
+  const formGuid = process.env.HUBSPOT_FORM_GUID || SUPPORT_FORM.formGuid;
+  const baseUrl = String(process.env.HUBSPOT_FORMS_BASE_URL || SUPPORT_FORM.defaultBaseUrl);
 
   const fields = buildSupportTicketFields(input);
-  const legalConsentOptions = buildSupportTicketConsent(input);
-  const context = buildSupportTicketContext(input);
+  const legalConsentOptions = buildSupportTicketConsent();
 
   const payload = {
     portalId,
@@ -524,10 +471,6 @@ async function submitSupportTicketForm(input) {
     fields,
     legalConsentOptions,
   };
-
-  if (context) {
-    payload.context = context;
-  }
 
   if (input?.submittedAt !== undefined) {
     payload.submittedAt = input.submittedAt;
@@ -538,12 +481,10 @@ async function submitSupportTicketForm(input) {
 
 async function uploadHubspotFormFile(input) {
   const portalId =
-    input?.portalId || process.env.HUBSPOT_PORTAL_ID || SUPPORT_FORM.portalId;
+    process.env.HUBSPOT_PORTAL_ID || SUPPORT_FORM.portalId;
   const formGuid =
-    input?.formGuid || process.env.HUBSPOT_FORM_GUID || SUPPORT_FORM.formGuid;
-  const baseUrl = String(
-    input?.baseUrl || process.env.HUBSPOT_FORMS_BASE_URL || SUPPORT_FORM.defaultBaseUrl
-  );
+    process.env.HUBSPOT_FORM_GUID || SUPPORT_FORM.formGuid;
+  const baseUrl = String(process.env.HUBSPOT_FORMS_BASE_URL || SUPPORT_FORM.defaultBaseUrl);
 
   if (!portalId) {
     throw new Error("Missing required field: portalId (or HUBSPOT_PORTAL_ID)");
@@ -641,25 +582,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "submit_support_ticket_form",
         description:
-          "Submits the Apps for Tableau support ticket form to HubSpot (preconfigured portal/form IDs).",
+          "Submits the Apps for Tableau support ticket form to HubSpot (portal/form IDs from env or defaults).",
         inputSchema: {
           type: "object",
           properties: {
-            portalId: {
-              type: "string",
-              description:
-                "Override portal ID (defaults to 25291663).",
-            },
-            formGuid: {
-              type: "string",
-              description:
-                "Override form GUID (defaults to dc44a5b5-9577-4633-97fb-3410c599168e).",
-            },
-            baseUrl: {
-              type: "string",
-              description:
-                "Override the HubSpot Forms base URL (e.g., https://api-eu1.hsforms.com).",
-            },
             firstName: {
               type: "string",
               description: "First name (firstname).",
@@ -709,62 +635,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Optional single file URL for TICKET.hs_file_upload.",
             },
-            consentConfirmationEmails: {
-              type: "boolean",
-              description:
-                "Required. Consent for confirmation emails (subscription type 130256869). Must be true.",
-            },
-            consentServiceSupport: {
-              type: "boolean",
-              description:
-                "Required. Consent for service/sales support (subscription type 125387774). Must be true.",
-            },
-            consentProductUpdates: {
-              type: "boolean",
-              description:
-                "Optional. Consent for product updates (subscription type 130256504).",
-            },
-            consentToProcess: {
-              type: "boolean",
-              description:
-                "Optional. Consent to process personal data. Must be true if provided.",
-            },
-            consentToProcessText: {
-              type: "string",
-              description:
-                "Optional. Consent-to-process text shown with GDPR consent.",
-            },
-            consentTexts: {
-              type: "object",
-              description: "Optional override text for consent checkboxes.",
-              properties: {
-                confirmationEmails: { type: "string" },
-                serviceSupport: { type: "string" },
-                productUpdates: { type: "string" },
-              },
-              additionalProperties: false,
-            },
-            context: {
-              type: "object",
-              description:
-                "Optional HubSpot tracking context (e.g., hutk, pageUri, pageName, ipAddress).",
-            },
-            hutk: {
-              type: "string",
-              description: "Optional HubSpot user token (hutk).",
-            },
-            pageUri: {
-              type: "string",
-              description: "Optional page URI for tracking context.",
-            },
-            pageName: {
-              type: "string",
-              description: "Optional page name for tracking context.",
-            },
-            ipAddress: {
-              type: "string",
-              description: "Optional IP address for tracking context.",
-            },
             submittedAt: {
               type: "number",
               description:
@@ -780,71 +650,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             "ticketDescription",
             "ticketExtension",
             "extensionVersion",
-            "consentConfirmationEmails",
-            "consentServiceSupport",
           ],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: "submit_hubspot_form",
-        description:
-          "Submits form fields to the HubSpot Forms API (legacy v3 integration endpoint).",
-        inputSchema: {
-          type: "object",
-          properties: {
-            portalId: {
-              type: "string",
-              description:
-                "HubSpot portal ID. Required unless HUBSPOT_PORTAL_ID is set.",
-            },
-            formGuid: {
-              type: "string",
-              description:
-                "HubSpot form GUID. Required unless HUBSPOT_FORM_GUID is set.",
-            },
-            baseUrl: {
-              type: "string",
-              description:
-                "Override the HubSpot Forms base URL (e.g., https://api.hsforms.com or https://api-eu1.hsforms.com).",
-            },
-            fields: {
-              type: "array",
-              description: "Form fields to submit.",
-              minItems: 1,
-              items: {
-                type: "object",
-                properties: {
-                  name: { type: "string" },
-                  value: {
-                    oneOf: [
-                      { type: "string" },
-                      { type: "number" },
-                      { type: "boolean" },
-                    ],
-                  },
-                },
-                required: ["name", "value"],
-                additionalProperties: false,
-              },
-            },
-            context: {
-              type: "object",
-              description:
-                "Optional HubSpot tracking context (e.g., hutk, pageUri, pageName, ipAddress).",
-            },
-            legalConsentOptions: {
-              type: "object",
-              description:
-                "Optional legal consent payload for GDPR compliance (as required by the form).",
-            },
-            submittedAt: {
-              type: "number",
-              description:
-                "Optional timestamp in milliseconds to set the submission time.",
-            },
-          },
-          required: ["fields"],
           additionalProperties: false,
         },
       },
@@ -855,21 +661,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            portalId: {
-              type: "string",
-              description:
-                "HubSpot portal ID. Required unless HUBSPOT_PORTAL_ID is set.",
-            },
-            formGuid: {
-              type: "string",
-              description:
-                "HubSpot form GUID. Required unless HUBSPOT_FORM_GUID is set.",
-            },
-            baseUrl: {
-              type: "string",
-              description:
-                "Override the HubSpot Forms base URL (e.g., https://api-eu1.hsforms.com).",
-            },
             filePath: {
               type: "string",
               description: "Local path to the file to upload.",
@@ -896,18 +687,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "evaluate_support_need") {
       result = await evaluateConversationForSupport(args.conversationHistory);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    }
-
-    if (toolName === "submit_hubspot_form") {
-      result = await submitHubspotForm(args);
       return {
         content: [
           {
