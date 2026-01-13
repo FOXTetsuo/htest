@@ -8,6 +8,7 @@
  * Required env vars:
  *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
  *   HUBSPOT_BCC_EMAIL (the hosted email, e.g., support@youraccount.hs-inbox.com)
+ *   HUBSPOT_ACCESS_TOKEN (private app token with conversations.write)
  *   WEBHOOK_PORT (optional, enable incoming webhook listener)
  */
 
@@ -20,6 +21,34 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 import nodemailer from "nodemailer";
+import express from "express";
+
+// Webhook handling - store pending webhook promises
+const pendingWebhooks = new Map();
+
+// Start Express server for incoming webhooks
+const app = express();
+app.use(express.json());
+
+app.post("/webhook/thread-id", (req, res) => {
+  const { email, threadId } = req.body;
+  
+  console.log(`Received webhook: email=${email}, threadId=${threadId}`);
+  
+  // Resolve the pending promise for this email
+  if (pendingWebhooks.has(email)) {
+    const { resolve } = pendingWebhooks.get(email);
+    resolve(threadId);
+    pendingWebhooks.delete(email);
+  }
+  
+  res.status(200).json({ success: true });
+});
+
+const WEBHOOK_PORT = process.env.WEBHOOK_PORT || 3000;
+app.listen(WEBHOOK_PORT, () => {
+  console.log(`Webhook server listening on port ${WEBHOOK_PORT}`);
+});
 
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -55,6 +84,52 @@ async function triggerHubspotWebhook(payload) {
     const errorBody = await response.text();
     throw new Error(`HubSpot webhook error ${response.status}: ${errorBody}`);
   }
+}
+
+async function sendWebhookAndWaitForThreadId(email) {
+  const WEBHOOK_URL = "https://api-eu1.hubapi.com/automation/v4/webhook-triggers/25291663/TZUh7IA";
+  const WEBHOOK_TIMEOUT = Number(process.env.WEBHOOK_TIMEOUT_MS || 30000);
+  
+  // Create a promise that will be resolved when webhook response comes in
+  const threadIdPromise = new Promise((resolve, reject) => {
+    pendingWebhooks.set(email, { resolve, reject });
+    
+    // Set timeout
+    setTimeout(() => {
+      if (pendingWebhooks.has(email)) {
+        pendingWebhooks.delete(email);
+        reject(new Error(`Webhook timeout after ${WEBHOOK_TIMEOUT}ms`));
+      }
+    }, WEBHOOK_TIMEOUT);
+  });
+  
+  // Send the webhook to HubSpot
+  const webhookPayload = {
+    email: email
+  };
+  
+  try {
+    const response = await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(webhookPayload),
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Webhook send failed: ${response.status} - ${errorText}`);
+    }
+    
+    console.log(`Sent webhook to HubSpot for email: ${email}`);
+  } catch (error) {
+    pendingWebhooks.delete(email);
+    throw new Error(`Failed to send webhook: ${error.message}`);
+  }
+  
+  // Wait for the incoming webhook response with thread ID
+  return threadIdPromise;
 }
 
 function analyzeConversationForSupport(conversationHistory) {
@@ -221,6 +296,15 @@ async function sendEmail(input) {
   if (!hubspotBccEmail) {
     throw new Error("HUBSPOT_BCC_EMAIL not configured (e.g., support@youraccount.hs-inbox.com)");
   }
+  const hubspotInboxId = process.env.HUBSPOT_INBOX_ID;
+  if (!hubspotInboxId) {
+    throw new Error("HUBSPOT_INBOX_ID not configured");
+  }
+  if (!process.env.HUBSPOT_ACCESS_TOKEN) {
+    throw new Error("HUBSPOT_ACCESS_TOKEN not configured");
+  }
+
+  const hubspotContactId = null;
 
   const finalSubject = subject || content.split('\n')[0].substring(0, 60);
 
@@ -310,17 +394,43 @@ async function sendEmail(input) {
   });
 
   const internalContactName = contactName || contactEmail;
-  const internalCommentText = buildInternalComment(internalContactName, contactEmail);
+  const internalCommentText =
+    "This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:\n" +
+    `Name: ${internalContactName}\n` +
+    `Email: ${contactEmail}`;
+  const internalCommentHtml = `<div style="font-family: Arial, sans-serif;">
+    <p>This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:</p>
+    <p><strong>Name:</strong> ${internalContactName}<br><strong>Email:</strong> ${contactEmail}</p>
+  </div>`;
 
-  await triggerHubspotWebhook({
-    contactName: internalContactName,
-    contactEmail,
-    subject: finalSubject,
-    messageId: info.messageId,
-    internalComment: internalCommentText,
+  const pollAttempts = Number(process.env.HUBSPOT_THREAD_POLL_ATTEMPTS || 5);
+  const pollIntervalMs = Number(process.env.HUBSPOT_THREAD_POLL_INTERVAL_MS || 3000);
+  const lookbackMs = Number(process.env.HUBSPOT_THREAD_LOOKBACK_MS || 10 * 60 * 1000);
+  const latestMessageTimestampAfter = emailSentAt - lookbackMs;
+
+  let threadId = null;
+  for (let attempt = 0; attempt < pollAttempts; attempt += 1) {
+    threadId = await findThreadIdByInbox({
+      inboxId: hubspotInboxId,
+      latestMessageTimestampAfter,
+      subject: finalSubject,
+    });
+
+    if (threadId) break;
+    if (attempt < pollAttempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+  }
+
+  if (!threadId) {
+    throw new Error("Unable to locate HubSpot thread for internal comment");
+  }
+
+  await postInternalComment({
+    threadId,
+    text: internalCommentText,
+    richText: internalCommentHtml,
   });
-
-
 
   return {
     success: true,
