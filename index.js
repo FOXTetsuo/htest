@@ -1,203 +1,178 @@
 /**
- * Email MCP Server
- * 
- * Sends customer support emails to HubSpot Conversations inbox via forwarding.
- * Emails are sent to customer with HubSpot inbox BCC'd for ticket creation.
- * Sends webhook payloads to trigger internal comment automation.
- * 
- * Required env vars:
- *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
- *   HUBSPOT_BCC_EMAIL (the hosted email, e.g., support@youraccount.hs-inbox.com)
- *   HUBSPOT_ACCESS_TOKEN (private app token with conversations.write)
- *   WEBHOOK_PORT (optional, enable incoming webhook listener)
+ * HubSpot Forms MCP Server
+ *
+ * Submits form data to HubSpot Forms API (legacy v3 endpoint).
+ * Includes a preconfigured tool for the support form in portal 25291663.
+ *
+ * Required env vars (unless provided in tool input):
+ *   HUBSPOT_PORTAL_ID, HUBSPOT_FORM_GUID
+ * Optional env vars:
+ *   HUBSPOT_FORMS_BASE_URL (e.g., https://api.hsforms.com or https://api-eu1.hsforms.com)
  */
 
 import "dotenv/config";
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import express from "express";
-import nodemailer from "nodemailer";
-import express from "express";
 
-// Webhook handling - store pending webhook promises
-const pendingWebhooks = new Map();
+const SUPPORT_FORM_TICKET_CATEGORY_VALUES = [
+  "PRODUCT_ISSUE",
+  "BILLING_ISSUE",
+  "FEATURE_REQUEST",
+  "GENERAL_INQUIRY",
+];
 
-// Start Express server for incoming webhooks
-const app = express();
-app.use(express.json());
+const SUPPORT_FORM_TICKET_CATEGORY_ALIASES = {
+  "Product issue": "PRODUCT_ISSUE",
+  "Billing issue": "BILLING_ISSUE",
+  "Feature request": "FEATURE_REQUEST",
+  "General inquiry": "GENERAL_INQUIRY",
+};
 
-app.post("/webhook/thread-id", (req, res) => {
-  const { email, threadId } = req.body;
-  
-  console.log(`Received webhook: email=${email}, threadId=${threadId}`);
-  
-  // Resolve the pending promise for this email
-  if (pendingWebhooks.has(email)) {
-    const { resolve } = pendingWebhooks.get(email);
-    resolve(threadId);
-    pendingWebhooks.delete(email);
-  }
-  
-  res.status(200).json({ success: true });
-});
+const SUPPORT_FORM_TICKET_CATEGORY_INPUTS = [
+  ...SUPPORT_FORM_TICKET_CATEGORY_VALUES,
+  ...Object.keys(SUPPORT_FORM_TICKET_CATEGORY_ALIASES),
+];
 
-const WEBHOOK_PORT = process.env.WEBHOOK_PORT || 3000;
-app.listen(WEBHOOK_PORT, () => {
-  console.log(`Webhook server listening on port ${WEBHOOK_PORT}`);
-});
+const SUPPORT_FORM_TICKET_EXTENSION_VALUES = [
+  "DashboardGuide",
+  "DashboardUsage",
+  "DreamTeams",
+  "DrillDownTree",
+  "EasyDesigns",
+  "ExtensionsManager",
+  "hierarchy-filter",
+  "MailScheduler",
+  "PerformanceInsight",
+  "PictureThis",
+  "ProcessMining",
+  "ScrollyTelling",
+  "ShowMeMore",
+  "SuperKPIs",
+  "SuperTables",
+  "viz-slides",
+  "WriteBackExtreme",
+  "No specific extension",
+];
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: process.env.SMTP_PORT || 587,
-  secure: process.env.SMTP_SECURE === "true",
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
+const SUPPORT_FORM_TICKET_EXTENSION_ALIASES = {
+  PowerKPIs: "SuperKPIs",
+  HierarchyFilter: "hierarchy-filter",
+  VizSlides: "viz-slides",
+};
+
+const SUPPORT_FORM_TICKET_EXTENSION_INPUTS = [
+  ...SUPPORT_FORM_TICKET_EXTENSION_VALUES,
+  ...Object.keys(SUPPORT_FORM_TICKET_EXTENSION_ALIASES),
+];
+
+const SUPPORT_FORM = {
+  portalId: "25291663",
+  formGuid: "dc44a5b5-9577-4633-97fb-3410c599168e",
+  defaultBaseUrl: "https://api-eu1.hsforms.com",
+  fieldNames: {
+    firstName: "firstname",
+    lastName: "lastname",
+    email: "email",
+    company: "company",
+    category: "TICKET.hs_ticket_category",
+    subject: "TICKET.subject",
+    content: "TICKET.content",
+    ticketExtension: "TICKET.ticket_extension",
+    extensionVersion: "TICKET.extension_version",
+    fileUpload: "TICKET.hs_file_upload",
   },
-});
-
-const HUBSPOT_WEBHOOK_URL =
-  "https://api-eu1.hubapi.com/automation/v4/webhook-triggers/25291663/Fpc2iX3";
-
-function buildInternalComment(contactName, contactEmail) {
-  const name = contactName || "Unknown";
-  const email = contactEmail || "Unknown";
-  return (
-    "This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:\n" +
-    `Name: ${name}\n` +
-    `Email: ${email}`
-  );
-}
-
-async function triggerHubspotWebhook(payload) {
-  const response = await fetch(HUBSPOT_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`HubSpot webhook error ${response.status}: ${errorBody}`);
-  }
-}
-
-async function sendWebhookAndWaitForThreadId(email) {
-  const WEBHOOK_URL = "https://api-eu1.hubapi.com/automation/v4/webhook-triggers/25291663/TZUh7IA";
-  const WEBHOOK_TIMEOUT = Number(process.env.WEBHOOK_TIMEOUT_MS || 30000);
-  
-  // Create a promise that will be resolved when webhook response comes in
-  const threadIdPromise = new Promise((resolve, reject) => {
-    pendingWebhooks.set(email, { resolve, reject });
-    
-    // Set timeout
-    setTimeout(() => {
-      if (pendingWebhooks.has(email)) {
-        pendingWebhooks.delete(email);
-        reject(new Error(`Webhook timeout after ${WEBHOOK_TIMEOUT}ms`));
-      }
-    }, WEBHOOK_TIMEOUT);
-  });
-  
-  // Send the webhook to HubSpot
-  const webhookPayload = {
-    email: email
-  };
-  
-  try {
-    const response = await fetch(WEBHOOK_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(webhookPayload),
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Webhook send failed: ${response.status} - ${errorText}`);
-    }
-    
-    console.log(`Sent webhook to HubSpot for email: ${email}`);
-  } catch (error) {
-    pendingWebhooks.delete(email);
-    throw new Error(`Failed to send webhook: ${error.message}`);
-  }
-  
-  // Wait for the incoming webhook response with thread ID
-  return threadIdPromise;
-}
+  subscriptionTypeIds: {
+    confirmationEmails: 130256869,
+    serviceSupport: 125387774,
+    productUpdates: 130256504,
+  },
+  consentTexts: {
+    confirmationEmails: "I agree to receive confirmation emails about my requests",
+    serviceSupport: "I agree to receive service/sales support",
+    productUpdates: "Subscribe for product updates and exclusive content",
+  },
+  consentToProcessText:
+    "I agree to allow Apps for Tableau to store and process my personal data.",
+};
 
 function analyzeConversationForSupport(conversationHistory) {
   if (!conversationHistory || conversationHistory.length === 0) {
     return { action: "no_action", reason: "No conversation history provided" };
   }
 
-  const lastMessages = conversationHistory.slice(-4).map(m => m.content.toLowerCase());
-  
-  const explicitSupportRequest = lastMessages.some(msg => 
+  const lastMessages = conversationHistory.slice(-4).map((m) => m.content.toLowerCase());
+
+  const explicitSupportRequest = lastMessages.some((msg) =>
     /support|agent|speak with|contact|help team|representative|specialist|support ticket/.test(msg)
   );
 
   if (explicitSupportRequest) {
-    return { 
-      action: "offer_or_create_ticket", 
+    return {
+      action: "offer_or_create_ticket",
       reason: "Customer explicitly requested support",
-      urgency: "high"
+      urgency: "high",
     };
   }
 
-  const negativeResponse = lastMessages.some(msg =>
-    /^(no|didn't help|doesn't work|still broken|still doesn't|nope|nah|didn't solve|doesn't solve)/.test(msg) ||
-    /didn't (help|work|solve)|doesn't (help|work|solve)|not (helpful|working)|still (broken|failing|doesn't)/.test(msg)
+  const negativeResponse = lastMessages.some(
+    (msg) =>
+      /^(no|didn't help|doesn't work|still broken|still doesn't|nope|nah|didn't solve|doesn't solve)/.test(msg) ||
+      /didn't (help|work|solve)|doesn't (help|work|solve)|not (helpful|working)|still (broken|failing|doesn't)/.test(msg)
   );
 
   if (negativeResponse) {
     return {
       action: "offer_or_create_ticket",
       reason: "Customer indicated suggested solution did not help",
-      urgency: "high"
+      urgency: "high",
     };
   }
 
-  const confusionOrError = lastMessages.some(msg =>
-    /error|failed|broken|stuck|confused|not sure|unclear|doesn't show|missing|not (working|appearing)|crash|freeze|hang/.test(msg)
+  const confusionOrError = lastMessages.some((msg) =>
+    /error|failed|broken|stuck|confused|not sure|unclear|doesn't show|missing|not (working|appearing)|crash|freeze|hang/.test(
+      msg
+    )
   );
 
   if (confusionOrError && conversationHistory.length >= 3) {
     return {
       action: "offer_ticket",
       reason: "Customer appears to be experiencing technical issues",
-      urgency: "medium"
+      urgency: "medium",
     };
   }
 
-  const uncertainResponse = lastMessages.some(msg =>
-    /\?$|what if|what about|how do i|can't figure|not clear|still don't|what do you mean|don't understand|what's|how's/.test(msg)
+  const uncertainResponse = lastMessages.some((msg) =>
+    /\?$|what if|what about|how do i|can't figure|not clear|still don't|what do you mean|don't understand|what's|how's/.test(
+      msg
+    )
   );
 
   if (uncertainResponse && conversationHistory.length >= 4) {
     return {
       action: "offer_ticket",
       reason: "Customer appears uncertain and may need direct assistance",
-      urgency: "medium"
+      urgency: "medium",
     };
   }
 
-  const positiveResponse = lastMessages.some(msg =>
-    /^(yes|yep|yeah|yup|thanks|that works|solved|fixed|great|perfect|ok|good)/.test(msg) ||
-    /works|solved|fixed|helpful|thanks/.test(msg)
+  const positiveResponse = lastMessages.some(
+    (msg) =>
+      /^(yes|yep|yeah|yup|thanks|that works|solved|fixed|great|perfect|ok|good)/.test(msg) ||
+      /works|solved|fixed|helpful|thanks/.test(msg)
   );
 
   if (positiveResponse) {
     return {
       action: "no_action",
       reason: "Customer seems satisfied with the solution",
-      urgency: "none"
+      urgency: "none",
     };
   }
 
@@ -205,14 +180,14 @@ function analyzeConversationForSupport(conversationHistory) {
     return {
       action: "offer_ticket",
       reason: "Conversation has continued without clear resolution",
-      urgency: "low"
+      urgency: "low",
     };
   }
 
   return {
     action: "no_action",
     reason: "Insufficient context to determine support need",
-    urgency: "none"
+    urgency: "none",
   };
 }
 
@@ -229,7 +204,7 @@ function extractCustomerInfo(conversationHistory) {
 
   for (const message of conversationHistory) {
     const content = message.content;
-    
+
     if (!email) {
       const emailMatch = content.match(emailPattern);
       if (emailMatch) email = emailMatch[0];
@@ -279,171 +254,353 @@ async function evaluateConversationForSupport(conversationHistory) {
   };
 }
 
-async function sendEmail(input) {
-  const content = input?.content ? String(input.content).trim() : "";
-  const contactEmail = input?.contactEmail ? String(input.contactEmail).trim() : "";
-  const contactName = input?.contactName ? String(input.contactName).trim() : "";
-  const subject = input?.subject ? String(input.subject).trim() : "";
-  const conversationHistory = input?.conversationHistory || [];
-  const productName = input?.productName ? String(input.productName).trim() : "";
-  const version = input?.version ? String(input.version).trim() : "";
-  const platform = input?.platform ? String(input.platform).trim() : "";
+function normalizeString(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
 
-  if (!content) throw new Error("Missing required field: content");
-  if (!contactEmail) throw new Error("Missing required field: contactEmail");
-
-  const hubspotBccEmail = process.env.HUBSPOT_BCC_EMAIL;
-  if (!hubspotBccEmail) {
-    throw new Error("HUBSPOT_BCC_EMAIL not configured (e.g., support@youraccount.hs-inbox.com)");
+function requireValue(value, fieldLabel) {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    throw new Error(`Missing required field: ${fieldLabel}`);
   }
-  const hubspotInboxId = process.env.HUBSPOT_INBOX_ID;
-  if (!hubspotInboxId) {
-    throw new Error("HUBSPOT_INBOX_ID not configured");
+  return normalized;
+}
+
+function requireEnum(value, allowed, fieldLabel, aliases = {}) {
+  const normalized = requireValue(value, fieldLabel);
+  const mapped = aliases[normalized] || normalized;
+  if (!allowed.includes(mapped)) {
+    const options = [...allowed, ...Object.keys(aliases)];
+    throw new Error(`Invalid ${fieldLabel}. Expected one of: ${options.join(", ")}`);
   }
-  if (!process.env.HUBSPOT_ACCESS_TOKEN) {
-    throw new Error("HUBSPOT_ACCESS_TOKEN not configured");
+  return mapped;
+}
+
+function requireTrue(value, fieldLabel) {
+  if (value !== true) {
+    throw new Error(`Missing required consent: ${fieldLabel}`);
+  }
+}
+
+function normalizeFileUrls(fileUrlsInput) {
+  if (!fileUrlsInput) return null;
+  const urls = Array.isArray(fileUrlsInput) ? fileUrlsInput : [fileUrlsInput];
+  const normalized = urls.map((url) => normalizeString(url)).filter(Boolean);
+  if (normalized.length === 0) return null;
+  return normalized.join(";");
+}
+
+function buildSupportTicketFields(input) {
+  const fields = [
+    {
+      name: SUPPORT_FORM.fieldNames.firstName,
+      value: requireValue(input?.firstName, "firstName"),
+    },
+    {
+      name: SUPPORT_FORM.fieldNames.lastName,
+      value: requireValue(input?.lastName, "lastName"),
+    },
+    {
+      name: SUPPORT_FORM.fieldNames.email,
+      value: requireValue(input?.email, "email"),
+    },
+    {
+      name: SUPPORT_FORM.fieldNames.category,
+      value: requireEnum(
+        input?.ticketCategory,
+        SUPPORT_FORM_TICKET_CATEGORY_VALUES,
+        "ticketCategory",
+        SUPPORT_FORM_TICKET_CATEGORY_ALIASES
+      ),
+    },
+    {
+      name: SUPPORT_FORM.fieldNames.subject,
+      value: requireValue(input?.ticketName, "ticketName"),
+    },
+    {
+      name: SUPPORT_FORM.fieldNames.content,
+      value: requireValue(input?.ticketDescription, "ticketDescription"),
+    },
+    {
+      name: SUPPORT_FORM.fieldNames.ticketExtension,
+      value: requireEnum(
+        input?.ticketExtension,
+        SUPPORT_FORM_TICKET_EXTENSION_VALUES,
+        "ticketExtension",
+        SUPPORT_FORM_TICKET_EXTENSION_ALIASES
+      ),
+    },
+    {
+      name: SUPPORT_FORM.fieldNames.extensionVersion,
+      value: requireValue(input?.extensionVersion, "extensionVersion"),
+    },
+  ];
+
+  const company = normalizeString(input?.company);
+  if (company) {
+    fields.push({ name: SUPPORT_FORM.fieldNames.company, value: company });
   }
 
-  const hubspotContactId = null;
-
-  const finalSubject = subject || content.split('\n')[0].substring(0, 60);
-
-  let emailText = "";
-  if (platform) emailText += `Platform: ${platform}\n\n`;
-
-  const productInfo = productName ? `${productName}${version ? ' ' + version : ''}` : (version ? `version ${version}` : "the product");
-  emailText += `Customer reported the following issue with ${productInfo}:\n\n`;
-  
-  const contentLines = content.split('\n');
-  let inIssuesSection = false;
-  let inSuggestionsSection = false;
-  let issuesText = "";
-  let suggestionsText = "";
-  
-  for (const line of contentLines) {
-    if (/issues?:/i.test(line) || /problems?:/i.test(line) || /errors?:/i.test(line)) {
-      inIssuesSection = true;
-      inSuggestionsSection = false;
-      continue;
-    } else if (/suggestions?:/i.test(line) || /fixes?:/i.test(line) || /solutions?:/i.test(line) || /tried:/i.test(line)) {
-      inIssuesSection = false;
-      inSuggestionsSection = true;
-      continue;
-    }
-    
-    if (inIssuesSection && line.trim()) {
-      issuesText += line + "\n";
-    } else if (inSuggestionsSection && line.trim()) {
-      suggestionsText += line + "\n";
-    }
+  const fileUrls = normalizeFileUrls(input?.fileUrls ?? input?.fileUrl);
+  if (fileUrls) {
+    fields.push({ name: SUPPORT_FORM.fieldNames.fileUpload, value: fileUrls });
   }
 
-  if (!issuesText && !suggestionsText) {
-    issuesText = content;
-  }
+  return fields;
+}
 
-  emailText += issuesText || content;
-  
-  if (suggestionsText) {
-    emailText += `\n\nI suggested the following fixes from the documentation:\n\n${suggestionsText}`;
-  }
+function buildSupportTicketConsent(input) {
+  requireTrue(input?.consentConfirmationEmails, "consentConfirmationEmails");
+  requireTrue(input?.consentServiceSupport, "consentServiceSupport");
 
-  if (conversationHistory && conversationHistory.length > 0) {
-    emailText += "\n\n--- Conversation History ---\n";
-    
-    conversationHistory.forEach((msg) => {
-      const role = msg.role === "user" ? "Customer" : "Assistant";
-      const msgContent = msg.content || "";
-      emailText += `\n[${role}]: ${msgContent}\n`;
+  const consentTexts = input?.consentTexts ?? {};
+  let consentToProcess = true;
+  if (typeof input?.consentToProcess === "boolean") {
+    requireTrue(input.consentToProcess, "consentToProcess");
+    consentToProcess = input.consentToProcess;
+  }
+  const consentToProcessText =
+    normalizeString(input?.consentToProcessText) || SUPPORT_FORM.consentToProcessText;
+
+  const communications = [
+    {
+      value: true,
+      subscriptionTypeId: SUPPORT_FORM.subscriptionTypeIds.confirmationEmails,
+      text: consentTexts.confirmationEmails || SUPPORT_FORM.consentTexts.confirmationEmails,
+    },
+    {
+      value: true,
+      subscriptionTypeId: SUPPORT_FORM.subscriptionTypeIds.serviceSupport,
+      text: consentTexts.serviceSupport || SUPPORT_FORM.consentTexts.serviceSupport,
+    },
+  ];
+
+  if (typeof input?.consentProductUpdates === "boolean") {
+    communications.push({
+      value: input.consentProductUpdates,
+      subscriptionTypeId: SUPPORT_FORM.subscriptionTypeIds.productUpdates,
+      text: consentTexts.productUpdates || SUPPORT_FORM.consentTexts.productUpdates,
     });
-    emailText += "\n--- End Conversation ---";
   }
 
-  let emailHtml = `<div style="font-family: Arial, sans-serif;">`;
-  if (platform) emailHtml += `<p><strong>Platform:</strong> ${platform}</p>`;
-  emailHtml += `<hr>`;
-  emailHtml += `<h3>Customer reported the following issue with ${productInfo}:</h3>`;
-  emailHtml += `<div style="margin: 15px 0;">${(issuesText || content).replace(/\n/g, "<br>")}</div>`;
-  
-  if (suggestionsText) {
-    emailHtml += `<h3>I suggested the following fixes from the documentation:</h3>`;
-    emailHtml += `<div style="margin: 15px 0;">${suggestionsText.replace(/\n/g, "<br>")}</div>`;
+  return {
+    consent: {
+      consentToProcess,
+      text: consentToProcessText,
+      communications,
+    },
+  };
+}
+
+function buildSupportTicketContext(input) {
+  if (input?.context && typeof input.context === "object") {
+    return input.context;
   }
 
-  if (conversationHistory && conversationHistory.length > 0) {
-    emailHtml += `<hr><h3>Conversation History</h3>`;
-    conversationHistory.forEach((msg) => {
-      const role = msg.role === "user" ? "Customer" : "Assistant";
-      const msgContent = msg.content || "";
-      emailHtml += `<div style="margin: 10px 0; padding: 10px; background: ${msg.role === 'user' ? '#f0f0f0' : '#e3f2fd'}; border-radius: 5px;"><strong>${role}:</strong><br>${msgContent.replace(/\n/g, "<br>")}</div>`;
-    });
+  const context = {};
+  const hutk = normalizeString(input?.hutk);
+  const pageUri = normalizeString(input?.pageUri);
+  const pageName = normalizeString(input?.pageName);
+  const ipAddress = normalizeString(input?.ipAddress);
+
+  if (hutk) context.hutk = hutk;
+  if (pageUri) context.pageUri = pageUri;
+  if (pageName) context.pageName = pageName;
+  if (ipAddress) context.ipAddress = ipAddress;
+
+  return Object.keys(context).length > 0 ? context : null;
+}
+
+function normalizeFields(fieldsInput) {
+  if (!Array.isArray(fieldsInput) || fieldsInput.length === 0) {
+    throw new Error("Missing required field: fields");
   }
 
-  emailHtml += `<hr><p style="color: #666;"><em>Support ticket created with GitBook assistant</em></p></div>`;
+  return fieldsInput.map((field, index) => {
+    if (!field || typeof field !== "object") {
+      throw new Error(`Invalid field at index ${index}`);
+    }
 
-  emailText += "\n\n---\nSupport ticket created with GitBook assistant";
+    const name = typeof field.name === "string" ? field.name.trim() : "";
+    if (!name) {
+      throw new Error(`Missing field name at index ${index}`);
+    }
 
-  const info = await transporter.sendMail({
-    from: process.env.SMTP_USER,
-    replyTo: contactEmail,
-    to: contactEmail,
-    bcc: hubspotBccEmail,
-    subject: finalSubject,
-    text: emailText,
-    html: emailHtml,
+    if (!("value" in field)) {
+      throw new Error(`Missing field value for ${name}`);
+    }
+
+    const value = field.value;
+    if (value === null || value === undefined) {
+      throw new Error(`Missing field value for ${name}`);
+    }
+
+    return { name, value: String(value) };
+  });
+}
+
+function buildFormSubmitUrl(baseUrl, portalId, formGuid) {
+  const trimmedBaseUrl = baseUrl.replace(/\/$/, "");
+  return `${trimmedBaseUrl}/submissions/v3/integration/submit/${portalId}/${formGuid}`;
+}
+
+function buildFormUploadUrl(baseUrl, portalId, formGuid) {
+  const trimmedBaseUrl = baseUrl.replace(/\/$/, "");
+  return `${trimmedBaseUrl}/uploads/form/v2/${portalId}/${formGuid}`;
+}
+
+async function submitHubspotForm(input) {
+  const portalId = input?.portalId || process.env.HUBSPOT_PORTAL_ID;
+  const formGuid = input?.formGuid || process.env.HUBSPOT_FORM_GUID;
+  const baseUrl = String(
+    input?.baseUrl || process.env.HUBSPOT_FORMS_BASE_URL || "https://api.hsforms.com"
+  );
+
+  if (!portalId) {
+    throw new Error("Missing required field: portalId (or HUBSPOT_PORTAL_ID)");
+  }
+
+  if (!formGuid) {
+    throw new Error("Missing required field: formGuid (or HUBSPOT_FORM_GUID)");
+  }
+
+  const fields = normalizeFields(input?.fields);
+
+  const payload = { fields };
+  if (input?.context && typeof input.context === "object") {
+    payload.context = input.context;
+  }
+  if (input?.legalConsentOptions && typeof input.legalConsentOptions === "object") {
+    payload.legalConsentOptions = input.legalConsentOptions;
+  }
+  if (input?.submittedAt !== undefined) {
+    payload.submittedAt = input.submittedAt;
+  }
+
+  const response = await fetch(buildFormSubmitUrl(baseUrl, portalId, formGuid), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
 
-  const internalContactName = contactName || contactEmail;
-  const internalCommentText =
-    "This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:\n" +
-    `Name: ${internalContactName}\n` +
-    `Email: ${contactEmail}`;
-  const internalCommentHtml = `<div style="font-family: Arial, sans-serif;">
-    <p>This ticket was made using the GitBook AI, please press the cross next to the contact to disassociate, and associate with the following contact:</p>
-    <p><strong>Name:</strong> ${internalContactName}<br><strong>Email:</strong> ${contactEmail}</p>
-  </div>`;
-
-  const pollAttempts = Number(process.env.HUBSPOT_THREAD_POLL_ATTEMPTS || 5);
-  const pollIntervalMs = Number(process.env.HUBSPOT_THREAD_POLL_INTERVAL_MS || 3000);
-  const lookbackMs = Number(process.env.HUBSPOT_THREAD_LOOKBACK_MS || 10 * 60 * 1000);
-  const latestMessageTimestampAfter = emailSentAt - lookbackMs;
-
-  let threadId = null;
-  for (let attempt = 0; attempt < pollAttempts; attempt += 1) {
-    threadId = await findThreadIdByInbox({
-      inboxId: hubspotInboxId,
-      latestMessageTimestampAfter,
-      subject: finalSubject,
-    });
-
-    if (threadId) break;
-    if (attempt < pollAttempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  const responseText = await response.text();
+  let responseBody = responseText;
+  if (responseText) {
+    try {
+      responseBody = JSON.parse(responseText);
+    } catch {
+      responseBody = responseText;
     }
   }
 
-  if (!threadId) {
-    throw new Error("Unable to locate HubSpot thread for internal comment");
+  if (!response.ok) {
+    const errorDetail =
+      typeof responseBody === "string" ? responseBody : JSON.stringify(responseBody);
+    throw new Error(`HubSpot form submission error ${response.status}: ${errorDetail}`);
   }
-
-  await postInternalComment({
-    threadId,
-    text: internalCommentText,
-    richText: internalCommentHtml,
-  });
 
   return {
     success: true,
-    messageId: info.messageId,
-    forwardedTo: hubspotBccEmail,
-    webhookTriggered: true,
+    response: responseBody || null,
+  };
+}
+
+async function submitSupportTicketForm(input) {
+  const portalId = input?.portalId || SUPPORT_FORM.portalId;
+  const formGuid = input?.formGuid || SUPPORT_FORM.formGuid;
+  const baseUrl = String(
+    input?.baseUrl || process.env.HUBSPOT_FORMS_BASE_URL || SUPPORT_FORM.defaultBaseUrl
+  );
+
+  const fields = buildSupportTicketFields(input);
+  const legalConsentOptions = buildSupportTicketConsent(input);
+  const context = buildSupportTicketContext(input);
+
+  const payload = {
+    portalId,
+    formGuid,
+    baseUrl,
+    fields,
+    legalConsentOptions,
+  };
+
+  if (context) {
+    payload.context = context;
+  }
+
+  if (input?.submittedAt !== undefined) {
+    payload.submittedAt = input.submittedAt;
+  }
+
+  return submitHubspotForm(payload);
+}
+
+async function uploadHubspotFormFile(input) {
+  const portalId =
+    input?.portalId || process.env.HUBSPOT_PORTAL_ID || SUPPORT_FORM.portalId;
+  const formGuid =
+    input?.formGuid || process.env.HUBSPOT_FORM_GUID || SUPPORT_FORM.formGuid;
+  const baseUrl = String(
+    input?.baseUrl || process.env.HUBSPOT_FORMS_BASE_URL || SUPPORT_FORM.defaultBaseUrl
+  );
+
+  if (!portalId) {
+    throw new Error("Missing required field: portalId (or HUBSPOT_PORTAL_ID)");
+  }
+
+  if (!formGuid) {
+    throw new Error("Missing required field: formGuid (or HUBSPOT_FORM_GUID)");
+  }
+
+  const filePath = normalizeString(input?.filePath);
+  if (!filePath) {
+    throw new Error("Missing required field: filePath");
+  }
+
+  const fileName = normalizeString(input?.fileName) || basename(filePath);
+  const fileBuffer = await readFile(filePath);
+
+  const formData = new FormData();
+  formData.append("file", new Blob([fileBuffer]), fileName);
+
+  const response = await fetch(buildFormUploadUrl(baseUrl, portalId, formGuid), {
+    method: "POST",
+    body: formData,
+  });
+
+  const responseText = await response.text();
+  let responseBody = responseText;
+  if (responseText) {
+    try {
+      responseBody = JSON.parse(responseText);
+    } catch {
+      responseBody = responseText;
+    }
+  }
+
+  if (!response.ok) {
+    const errorDetail =
+      typeof responseBody === "string" ? responseBody : JSON.stringify(responseBody);
+    throw new Error(`HubSpot file upload error ${response.status}: ${errorDetail}`);
+  }
+
+  const fileUrl =
+    responseBody && typeof responseBody === "object"
+      ? responseBody.url || responseBody.fileUrl || responseBody.filePath || null
+      : null;
+
+  return {
+    success: true,
+    fileUrl,
+    response: responseBody || null,
   };
 }
 
 // ---------- MCP server ----------
 const server = new Server(
   {
-    name: "email-forwarding-server",
+    name: "hubspot-forms-server",
     version: "1.0.0",
   },
   {
@@ -465,69 +622,264 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             conversationHistory: {
               type: "array",
-              description: "Array of conversation messages with 'role' (user/assistant) and 'content' (message text)",
+              description:
+                "Array of conversation messages with 'role' (user/assistant) and 'content' (message text)",
               items: {
                 type: "object",
                 properties: {
                   role: { type: "string", enum: ["user", "assistant"] },
-                  content: { type: "string" }
+                  content: { type: "string" },
                 },
-                required: ["role", "content"]
-              }
-            }
+                required: ["role", "content"],
+              },
+            },
           },
           required: ["conversationHistory"],
           additionalProperties: false,
         },
       },
       {
-        name: "send_customer_email",
+        name: "submit_support_ticket_form",
         description:
-          "Sends a customer support email to the customer while BCC'ing the HubSpot Conversations inbox for ticket creation.",
+          "Submits the Apps for Tableau support ticket form to HubSpot (preconfigured portal/form IDs).",
         inputSchema: {
           type: "object",
           properties: {
-            content: {
+            portalId: {
               type: "string",
-              description: "The message content to send.",
+              description:
+                "Override portal ID (defaults to 25291663).",
             },
-            contactEmail: {
+            formGuid: {
               type: "string",
-              description: "Customer email address (required). Will be used as the sender so HubSpot associates correctly to the customer contact.",
+              description:
+                "Override form GUID (defaults to dc44a5b5-9577-4633-97fb-3410c599168e).",
             },
-            contactName: { 
-              type: "string", 
-              description: "Customer name (optional). Used in the webhook payload." 
-            },
-            subject: {
+            baseUrl: {
               type: "string",
-              description: "Email subject line (optional). If not provided, will use first line of message content."
+              description:
+                "Override the HubSpot Forms base URL (e.g., https://api-eu1.hsforms.com).",
             },
-            conversationHistory: {
+            firstName: {
+              type: "string",
+              description: "First name (firstname).",
+            },
+            lastName: {
+              type: "string",
+              description: "Last name (lastname).",
+            },
+            email: {
+              type: "string",
+              description: "Email address (email).",
+            },
+            company: {
+              type: "string",
+              description: "Company name (company).",
+            },
+            ticketCategory: {
+              type: "string",
+              description: "Ticket category (TICKET.hs_ticket_category).",
+              enum: SUPPORT_FORM_TICKET_CATEGORY_INPUTS,
+            },
+            ticketName: {
+              type: "string",
+              description: "Ticket name (TICKET.subject).",
+            },
+            ticketDescription: {
+              type: "string",
+              description: "Ticket description (TICKET.content).",
+            },
+            ticketExtension: {
+              type: "string",
+              description: "Ticket product type (TICKET.ticket_extension).",
+              enum: SUPPORT_FORM_TICKET_EXTENSION_INPUTS,
+            },
+            extensionVersion: {
+              type: "string",
+              description: "Extension version (TICKET.extension_version).",
+            },
+            fileUrls: {
               type: "array",
-              description: "Full conversation history (optional). Array of message objects with 'role' and 'content' fields. Will be formatted and included in the email.",
+              description:
+                "Optional file URLs (from HubSpot form upload) for TICKET.hs_file_upload.",
+              items: { type: "string" },
+            },
+            fileUrl: {
+              type: "string",
+              description:
+                "Optional single file URL for TICKET.hs_file_upload.",
+            },
+            consentConfirmationEmails: {
+              type: "boolean",
+              description:
+                "Required. Consent for confirmation emails (subscription type 130256869). Must be true.",
+            },
+            consentServiceSupport: {
+              type: "boolean",
+              description:
+                "Required. Consent for service/sales support (subscription type 125387774). Must be true.",
+            },
+            consentProductUpdates: {
+              type: "boolean",
+              description:
+                "Optional. Consent for product updates (subscription type 130256504).",
+            },
+            consentToProcess: {
+              type: "boolean",
+              description:
+                "Optional. Consent to process personal data. Must be true if provided.",
+            },
+            consentToProcessText: {
+              type: "string",
+              description:
+                "Optional. Consent-to-process text shown with GDPR consent.",
+            },
+            consentTexts: {
+              type: "object",
+              description: "Optional override text for consent checkboxes.",
+              properties: {
+                confirmationEmails: { type: "string" },
+                serviceSupport: { type: "string" },
+                productUpdates: { type: "string" },
+              },
+              additionalProperties: false,
+            },
+            context: {
+              type: "object",
+              description:
+                "Optional HubSpot tracking context (e.g., hutk, pageUri, pageName, ipAddress).",
+            },
+            hutk: {
+              type: "string",
+              description: "Optional HubSpot user token (hutk).",
+            },
+            pageUri: {
+              type: "string",
+              description: "Optional page URI for tracking context.",
+            },
+            pageName: {
+              type: "string",
+              description: "Optional page name for tracking context.",
+            },
+            ipAddress: {
+              type: "string",
+              description: "Optional IP address for tracking context.",
+            },
+            submittedAt: {
+              type: "number",
+              description:
+                "Optional timestamp in milliseconds to set the submission time.",
+            },
+          },
+          required: [
+            "firstName",
+            "lastName",
+            "email",
+            "ticketCategory",
+            "ticketName",
+            "ticketDescription",
+            "ticketExtension",
+            "extensionVersion",
+            "consentConfirmationEmails",
+            "consentServiceSupport",
+          ],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "submit_hubspot_form",
+        description:
+          "Submits form fields to the HubSpot Forms API (legacy v3 integration endpoint).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            portalId: {
+              type: "string",
+              description:
+                "HubSpot portal ID. Required unless HUBSPOT_PORTAL_ID is set.",
+            },
+            formGuid: {
+              type: "string",
+              description:
+                "HubSpot form GUID. Required unless HUBSPOT_FORM_GUID is set.",
+            },
+            baseUrl: {
+              type: "string",
+              description:
+                "Override the HubSpot Forms base URL (e.g., https://api.hsforms.com or https://api-eu1.hsforms.com).",
+            },
+            fields: {
+              type: "array",
+              description: "Form fields to submit.",
+              minItems: 1,
               items: {
                 type: "object",
                 properties: {
-                  role: { type: "string" },
-                  content: { type: "string" }
-                }
-              }
+                  name: { type: "string" },
+                  value: {
+                    oneOf: [
+                      { type: "string" },
+                      { type: "number" },
+                      { type: "boolean" },
+                    ],
+                  },
+                },
+                required: ["name", "value"],
+                additionalProperties: false,
+              },
             },
-            productName: {
-              type: "string",
-              description: "Name of the product (e.g., 'MailScheduler', 'Writeback Extreme'). Used in email header and HubSpot contact property."
+            context: {
+              type: "object",
+              description:
+                "Optional HubSpot tracking context (e.g., hutk, pageUri, pageName, ipAddress).",
             },
-            version: {
-              type: "string",
-              description: "Product version number (e.g., '1.2.3', '2.0'). Used in email header and HubSpot contact property."
+            legalConsentOptions: {
+              type: "object",
+              description:
+                "Optional legal consent payload for GDPR compliance (as required by the form).",
             },
-            platform: {
-              type: "string",
-              description: "Operating system platform (e.g., 'Windows', 'Linux', 'macOS'). Displayed in email metadata and HubSpot contact property."
+            submittedAt: {
+              type: "number",
+              description:
+                "Optional timestamp in milliseconds to set the submission time.",
             },
           },
-          required: ["content", "contactEmail"],
+          required: ["fields"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "upload_hubspot_form_file",
+        description:
+          "Uploads a file to the HubSpot form upload endpoint and returns a file URL to use in submissions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            portalId: {
+              type: "string",
+              description:
+                "HubSpot portal ID. Required unless HUBSPOT_PORTAL_ID is set.",
+            },
+            formGuid: {
+              type: "string",
+              description:
+                "HubSpot form GUID. Required unless HUBSPOT_FORM_GUID is set.",
+            },
+            baseUrl: {
+              type: "string",
+              description:
+                "Override the HubSpot Forms base URL (e.g., https://api-eu1.hsforms.com).",
+            },
+            filePath: {
+              type: "string",
+              description: "Local path to the file to upload.",
+            },
+            fileName: {
+              type: "string",
+              description: "Optional filename override for the upload.",
+            },
+          },
+          required: ["filePath"],
           additionalProperties: false,
         },
       },
@@ -552,29 +904,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         ],
       };
-    } else if (toolName === "send_customer_email") {
-      result = await sendEmail(args);
+    }
+
+    if (toolName === "submit_hubspot_form") {
+      result = await submitHubspotForm(args);
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                success: true,
-                message: "Your support request has been sent to the Apps for Tableau support team. We will get back to you ASAP!",
-                messageId: result.messageId,
-                forwardedTo: result.forwardedTo,
-                webhookTriggered: result.webhookTriggered,
-              },
-              null,
-              2
-            ),
+            text: JSON.stringify(result, null, 2),
           },
         ],
       };
-    } else {
-      throw new Error(`Unknown tool: ${toolName}`);
     }
+
+    if (toolName === "submit_support_ticket_form") {
+      result = await submitSupportTicketForm(args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "upload_hubspot_form_file") {
+      result = await uploadHubspotFormFile(args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+
+    throw new Error(`Unknown tool: ${toolName}`);
   } catch (error) {
     return {
       content: [
@@ -599,39 +967,6 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("HubSpot MCP Server running on stdio");
-
-  const webhookPort = Number(process.env.WEBHOOK_PORT || process.env.PORT);
-  if (webhookPort) {
-    const app = express();
-    app.use(express.json({ limit: "1mb" }));
-
-    app.post(["/", "/webhook"], async (req, res) => {
-      const body = req.body && typeof req.body === "object" ? req.body : {};
-      const keys = Object.keys(body);
-      const hasOnlyThreadId = keys.length === 1 && keys[0] === "hs_thread_id";
-
-      if (!hasOnlyThreadId) {
-        res.status(204).end();
-        return;
-      }
-
-      try {
-        const internalCommentText = buildInternalComment(null, null);
-        await triggerHubspotWebhook({
-          hs_thread_id: body.hs_thread_id,
-          internalComment: internalCommentText,
-        });
-        res.status(200).json({ success: true });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ success: false, error: message });
-      }
-    });
-
-    app.listen(webhookPort, () => {
-      console.error(`Webhook listener running on port ${webhookPort}`);
-    });
-  }
 }
 
 main().catch((error) => {
