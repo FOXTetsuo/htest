@@ -6,12 +6,10 @@
  *
  * Env vars:
  *   HUBSPOT_PORTAL_ID, HUBSPOT_FORM_GUID, HUBSPOT_FORMS_BASE_URL
- *   (used by the support form and file upload when set; otherwise defaults apply)
+ *   (used by the support form when set; otherwise defaults apply)
  */
 
 import "dotenv/config";
-import { readFile } from "node:fs/promises";
-import { basename } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -84,7 +82,6 @@ const SUPPORT_FORM = {
     content: "TICKET.content",
     ticketExtension: "TICKET.ticket_extension",
     extensionVersion: "TICKET.extension_version",
-    fileUpload: "TICKET.hs_file_upload",
   },
   subscriptionTypeIds: {
     confirmationEmails: 130256869,
@@ -274,15 +271,95 @@ function requireEnum(value, allowed, fieldLabel, aliases = {}) {
   return mapped;
 }
 
-function normalizeFileUrls(fileUrlsInput) {
-  if (!fileUrlsInput) return null;
-  const urls = Array.isArray(fileUrlsInput) ? fileUrlsInput : [fileUrlsInput];
-  const normalized = urls.map((url) => normalizeString(url)).filter(Boolean);
-  if (normalized.length === 0) return null;
-  return normalized.join(";");
+function formatConversationHistory(conversationHistory) {
+  if (!Array.isArray(conversationHistory) || conversationHistory.length === 0) {
+    return "";
+  }
+
+  const lines = [];
+  for (const entry of conversationHistory) {
+    if (!entry || typeof entry !== "object") continue;
+
+    const roleRaw = normalizeString(entry.role).toLowerCase();
+    const role =
+      roleRaw === "user"
+        ? "Customer"
+        : roleRaw === "assistant"
+          ? "Assistant"
+          : roleRaw
+            ? roleRaw
+            : "Participant";
+    const content = normalizeString(entry.content);
+    if (!content) continue;
+
+    lines.push(`[${role}]: ${content}`);
+  }
+
+  return lines.join("\n");
+}
+
+function findLastUserMessage(conversationHistory) {
+  if (!Array.isArray(conversationHistory)) return "";
+
+  for (let index = conversationHistory.length - 1; index >= 0; index -= 1) {
+    const entry = conversationHistory[index];
+    if (!entry || typeof entry !== "object") continue;
+    if (String(entry.role).toLowerCase() !== "user") continue;
+
+    const content = normalizeString(entry.content);
+    if (content) return content;
+  }
+
+  return "";
+}
+
+function collectRecentUserMessages(conversationHistory, limit = 3) {
+  if (!Array.isArray(conversationHistory)) return [];
+  const messages = conversationHistory
+    .filter((entry) => entry && typeof entry === "object")
+    .filter((entry) => String(entry.role).toLowerCase() === "user")
+    .map((entry) => normalizeString(entry.content))
+    .filter(Boolean);
+
+  if (messages.length <= limit) return messages;
+  return messages.slice(-limit);
+}
+
+function truncateSubject(text, maxLength = 80) {
+  const normalized = normalizeString(text);
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
+function deriveTicketSubject(input) {
+  const override = normalizeString(input?.ticketName);
+  if (override) return override;
+
+  const lastUserMessage = findLastUserMessage(input?.conversationHistory);
+  const fallback = lastUserMessage || "Support request";
+  const extension = normalizeString(input?.ticketExtension);
+  const prefix =
+    extension && extension !== "No specific extension" ? `${extension}: ` : "";
+
+  return truncateSubject(`${prefix}${fallback}`);
+}
+
+function deriveTicketDescription(input) {
+  const override = normalizeString(input?.ticketDescription);
+  const summaryMessages = collectRecentUserMessages(input?.conversationHistory);
+  const summary =
+    override || summaryMessages.join("\n") || "Customer requested support.";
+
+  const conversationHistory = formatConversationHistory(input?.conversationHistory);
+  if (!conversationHistory) return summary;
+
+  return `${summary}\n\n--- Conversation History ---\n${conversationHistory}\n--- End Conversation ---`;
 }
 
 function buildSupportTicketFields(input) {
+  const ticketName = deriveTicketSubject(input);
+  const ticketDescription = deriveTicketDescription(input);
+
   const fields = [
     {
       name: SUPPORT_FORM.fieldNames.firstName,
@@ -307,11 +384,11 @@ function buildSupportTicketFields(input) {
     },
     {
       name: SUPPORT_FORM.fieldNames.subject,
-      value: requireValue(input?.ticketName, "ticketName"),
+      value: ticketName,
     },
     {
       name: SUPPORT_FORM.fieldNames.content,
-      value: requireValue(input?.ticketDescription, "ticketDescription"),
+      value: ticketDescription,
     },
     {
       name: SUPPORT_FORM.fieldNames.ticketExtension,
@@ -331,11 +408,6 @@ function buildSupportTicketFields(input) {
   const company = normalizeString(input?.company);
   if (company) {
     fields.push({ name: SUPPORT_FORM.fieldNames.company, value: company });
-  }
-
-  const fileUrls = normalizeFileUrls(input?.fileUrls ?? input?.fileUrl);
-  if (fileUrls) {
-    fields.push({ name: SUPPORT_FORM.fieldNames.fileUpload, value: fileUrls });
   }
 
   return fields;
@@ -393,11 +465,6 @@ function normalizeFields(fieldsInput) {
 function buildFormSubmitUrl(baseUrl, portalId, formGuid) {
   const trimmedBaseUrl = baseUrl.replace(/\/$/, "");
   return `${trimmedBaseUrl}/submissions/v3/integration/submit/${portalId}/${formGuid}`;
-}
-
-function buildFormUploadUrl(baseUrl, portalId, formGuid) {
-  const trimmedBaseUrl = baseUrl.replace(/\/$/, "");
-  return `${trimmedBaseUrl}/uploads/form/v2/${portalId}/${formGuid}`;
 }
 
 async function submitHubspotForm(input) {
@@ -479,65 +546,6 @@ async function submitSupportTicketForm(input) {
   return submitHubspotForm(payload);
 }
 
-async function uploadHubspotFormFile(input) {
-  const portalId =
-    process.env.HUBSPOT_PORTAL_ID || SUPPORT_FORM.portalId;
-  const formGuid =
-    process.env.HUBSPOT_FORM_GUID || SUPPORT_FORM.formGuid;
-  const baseUrl = String(process.env.HUBSPOT_FORMS_BASE_URL || SUPPORT_FORM.defaultBaseUrl);
-
-  if (!portalId) {
-    throw new Error("Missing required field: portalId (or HUBSPOT_PORTAL_ID)");
-  }
-
-  if (!formGuid) {
-    throw new Error("Missing required field: formGuid (or HUBSPOT_FORM_GUID)");
-  }
-
-  const filePath = normalizeString(input?.filePath);
-  if (!filePath) {
-    throw new Error("Missing required field: filePath");
-  }
-
-  const fileName = normalizeString(input?.fileName) || basename(filePath);
-  const fileBuffer = await readFile(filePath);
-
-  const formData = new FormData();
-  formData.append("file", new Blob([fileBuffer]), fileName);
-
-  const response = await fetch(buildFormUploadUrl(baseUrl, portalId, formGuid), {
-    method: "POST",
-    body: formData,
-  });
-
-  const responseText = await response.text();
-  let responseBody = responseText;
-  if (responseText) {
-    try {
-      responseBody = JSON.parse(responseText);
-    } catch {
-      responseBody = responseText;
-    }
-  }
-
-  if (!response.ok) {
-    const errorDetail =
-      typeof responseBody === "string" ? responseBody : JSON.stringify(responseBody);
-    throw new Error(`HubSpot file upload error ${response.status}: ${errorDetail}`);
-  }
-
-  const fileUrl =
-    responseBody && typeof responseBody === "object"
-      ? responseBody.url || responseBody.fileUrl || responseBody.filePath || null
-      : null;
-
-  return {
-    success: true,
-    fileUrl,
-    response: responseBody || null,
-  };
-}
-
 // ---------- MCP server ----------
 const server = new Server(
   {
@@ -609,11 +617,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             ticketName: {
               type: "string",
-              description: "Ticket name (TICKET.subject).",
+              description:
+                "Optional override for ticket name (TICKET.subject). If omitted, generated from conversation.",
             },
             ticketDescription: {
               type: "string",
-              description: "Ticket description (TICKET.content).",
+              description:
+                "Optional override for ticket description (TICKET.content). If omitted, generated from conversation.",
+            },
+            conversationHistory: {
+              type: "array",
+              description:
+                "Optional conversation history used to generate or append to the ticket description.",
+              items: {
+                type: "object",
+                properties: {
+                  role: { type: "string", enum: ["user", "assistant"] },
+                  content: { type: "string" },
+                },
+                required: ["role", "content"],
+                additionalProperties: false,
+              },
             },
             ticketExtension: {
               type: "string",
@@ -623,17 +647,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             extensionVersion: {
               type: "string",
               description: "Extension version (TICKET.extension_version).",
-            },
-            fileUrls: {
-              type: "array",
-              description:
-                "Optional file URLs (from HubSpot form upload) for TICKET.hs_file_upload.",
-              items: { type: "string" },
-            },
-            fileUrl: {
-              type: "string",
-              description:
-                "Optional single file URL for TICKET.hs_file_upload.",
             },
             submittedAt: {
               type: "number",
@@ -646,31 +659,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             "lastName",
             "email",
             "ticketCategory",
-            "ticketName",
-            "ticketDescription",
             "ticketExtension",
             "extensionVersion",
           ],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: "upload_hubspot_form_file",
-        description:
-          "Uploads a file to the HubSpot form upload endpoint and returns a file URL to use in submissions.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            filePath: {
-              type: "string",
-              description: "Local path to the file to upload.",
-            },
-            fileName: {
-              type: "string",
-              description: "Optional filename override for the upload.",
-            },
-          },
-          required: ["filePath"],
           additionalProperties: false,
         },
       },
@@ -699,18 +690,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "submit_support_ticket_form") {
       result = await submitSupportTicketForm(args);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    }
-
-    if (toolName === "upload_hubspot_form_file") {
-      result = await uploadHubspotFormFile(args);
       return {
         content: [
           {
